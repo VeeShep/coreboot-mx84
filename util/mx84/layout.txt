@@ -1,0 +1,6 @@
+00000000:0000ffff descriptor
+00010000:006fffff bootkernel1_main
+00700000:00700fff bootkernel1_write_test
+00701000:0070ffff bootkernel1_tail
+00710000:00dfffff bootkernel2_recovery
+00e00000:00ffffff coreboot_cbfs

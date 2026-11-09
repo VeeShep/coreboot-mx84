@@ -1,0 +1,92 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ] || [ ! -d "$1" ]; then
+	echo "usage: mx84-vendor-install STOCK_ROOTFS" >&2
+	exit 2
+fi
+[ "$(id -u)" -eq 0 ] || { echo "mx84-vendor-install must run as root" >&2; exit 1; }
+
+source_root=${1%/}
+destination=${MX84_VENDOR_DESTINATION:-/opt/mx84/vendor}
+loader=$source_root/lib/ld-musl-x86_64.so.1
+case "$destination" in
+	/*/*) ;;
+	*) echo "refusing unsafe vendor destination: $destination" >&2; exit 1 ;;
+esac
+parent=$(dirname -- "$destination")
+
+find_one()
+{
+	results=$(find "$source_root" -type f -name "$1" -print)
+	count=$(printf '%s\n' "$results" | sed '/^$/d' | wc -l)
+	[ "$count" -eq 1 ] || {
+		echo "expected one $1 under $source_root; found $count" >&2
+		exit 1
+	}
+	printf '%s\n' "$results"
+}
+
+daemon=$(find_one vtss_poca_d)
+control=$(find_one vtssctl)
+[ -e "$loader" ] || { echo "missing stock musl loader: $loader" >&2; exit 1; }
+[ ! -e "$destination" ] || { echo "refusing to overwrite existing vendor runtime: $destination" >&2; exit 1; }
+
+if [ ! -d "$parent" ]; then
+	grandparent=$(dirname -- "$parent")
+	name=$(basename -- "$parent")
+	[ -d "$grandparent" ] || { echo "vendor destination parent is unavailable: $grandparent" >&2; exit 1; }
+	near=$(find "$grandparent" -maxdepth 1 -type d -iname "$name" -print)
+	[ -z "$near" ] || { echo "case-conflicting vendor directory exists: $near" >&2; exit 1; }
+	install -d -m 0755 "$parent"
+fi
+
+work=$(mktemp -d "$parent/.vendor.XXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+root=$work/rootfs
+install -d -m 0755 "$root/lib" "$root/usr/lib" "$root/usr/sbin"
+
+copy_path()
+{
+	source=$1
+	while :; do
+		case "$source" in
+			/lib/ld-musl-x86_64.so.1) source=$source_root$source ;;
+			"$source_root"/*) ;;
+			*) echo "refusing dependency outside stock rootfs: $source" >&2; exit 1 ;;
+		esac
+		[ -e "$source" ] || { echo "missing vendor dependency: $source" >&2; exit 1; }
+		relative=${source#"$source_root"/}
+		install -d -m 0755 "$root/$(dirname -- "$relative")"
+		[ -e "$root/$relative" ] || cp -a "$source" "$root/$relative"
+		[ -L "$source" ] || break
+		target=$(readlink "$source")
+		case "$target" in
+			/*) source=$source_root$target ;;
+			*) source=$(dirname -- "$source")/$target ;;
+		esac
+	done
+}
+
+copy_path "$loader"
+copy_path "$daemon"
+copy_path "$control"
+for binary in "$daemon" "$control"; do
+	LD_LIBRARY_PATH=$source_root/usr/lib:$source_root/lib "$loader" --list "$binary" 2>&1 |
+		awk '$2 == "=>" && $3 ~ /^\// { print $3 }' |
+		while IFS= read -r dependency; do copy_path "$dependency"; done
+done
+
+new_loader=$root/lib/ld-musl-x86_64.so.1
+for binary in vtss_poca_d vtssctl; do
+	LD_LIBRARY_PATH=$root/usr/lib:$root/lib "$new_loader" --list "$root/usr/sbin/$binary" >/dev/null
+done
+(
+	cd "$work"
+	find rootfs -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+)
+chmod 0644 "$work/SHA256SUMS"
+mv "$work" "$destination"
+trap - EXIT HUP INT TERM
+echo "vendor runtime and dependency closure installed under $destination"
+echo "proprietary files remain outside the package and repository"

@@ -1,0 +1,76 @@
+#!/usr/bin/python3
+"""Turn a verified Linux input event into one clean reboot after a hold."""
+
+import os
+import selectors
+import struct
+import subprocess
+import time
+from pathlib import Path
+
+
+CONFIG = Path(os.environ.get("MX84_RESET_CONFIG", "/etc/mx84/reset-button.conf"))
+EVENT = struct.Struct("@llHHi")
+EV_KEY = 1
+
+
+def load_config(path=CONFIG):
+    values = {}
+    if path.exists():
+        for raw in path.read_text().splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+    return values
+
+
+class HoldGate:
+    def __init__(self, seconds=2.0):
+        self.seconds = seconds
+        self.pressed_at = None
+        self.latched = False
+
+    def event(self, value, now):
+        if value == 1 and self.pressed_at is None and not self.latched:
+            self.pressed_at = now
+        elif value == 0:
+            self.pressed_at = None
+            self.latched = False
+
+    def due(self, now):
+        if self.pressed_at is None or self.latched or now - self.pressed_at < self.seconds:
+            return False
+        self.latched = True
+        return True
+
+
+def main():
+    config = load_config()
+    device = config.get("INPUT_DEVICE", "UNVERIFIED")
+    code = config.get("KEY_CODE", "UNVERIFIED")
+    if device == "UNVERIFIED" or code == "UNVERIFIED":
+        print("MX84 reset-button input is unverified; handler remains inactive")
+        return 0
+    key_code = int(code, 0)
+    hold = HoldGate(float(config.get("HOLD_SECONDS", "2.0")))
+    selector = selectors.DefaultSelector()
+    with open(device, "rb", buffering=0) as source:
+        selector.register(source, selectors.EVENT_READ)
+        while True:
+            timeout = None if hold.pressed_at is None or hold.latched else max(0, hold.pressed_at + hold.seconds - time.monotonic())
+            ready = selector.select(timeout)
+            now = time.monotonic()
+            for key, _mask in ready:
+                data = key.fileobj.read(EVENT.size)
+                if len(data) != EVENT.size:
+                    return 1
+                _sec, _usec, event_type, event_code, value = EVENT.unpack(data)
+                if event_type == EV_KEY and event_code == key_code and value in (0, 1):
+                    hold.event(value, now)
+            if hold.due(now):
+                subprocess.run(["systemctl", "reboot"], check=False)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

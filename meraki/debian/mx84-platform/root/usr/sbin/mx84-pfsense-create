@@ -1,0 +1,139 @@
+#!/usr/bin/python3
+"""Define the commissioned MX84 pfSense VM with deterministic NIC order."""
+
+import argparse
+import hashlib
+import os
+import subprocess
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+BRIDGES = [
+    ("WAN1", "br-wan1"), ("WAN2", "br-wan2"),
+    *((f"LAN{i}", f"br-lan{i}") for i in range(1, 9)),
+    ("SFP1", "br-sfp1"), ("SFP2", "br-sfp2"),
+    ("CONTROL", "br-pfctl"),
+]
+DISK = Path("/var/lib/libvirt/images/pfsense.qcow2")
+COMMISSIONED = Path("/var/lib/mx84-platform/network-commissioned")
+
+
+def run(command, **kwargs):
+    return subprocess.run(command, text=True, check=True, **kwargs)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def customize_xml(xml):
+    root = ET.fromstring(xml)
+    operating_system = root.find("os")
+    if operating_system is None:
+        raise ValueError("generated definition has no guest OS")
+    for boot in operating_system.findall("boot"):
+        operating_system.remove(boot)
+    for device in ("hd", "cdrom"):
+        ET.SubElement(operating_system, "boot", {"dev": device})
+    reboot = root.find("on_reboot")
+    if reboot is None:
+        reboot = ET.SubElement(root, "on_reboot")
+    reboot.text = "restart"
+    description = root.find("description")
+    if description is None:
+        description = ET.SubElement(root, "description")
+    description.text = "vtnet0-12: " + ", ".join(label for label, _bridge in BRIDGES)
+    devices = root.find("devices")
+    balloon = devices.find("memballoon")
+    if balloon is not None:
+        devices.remove(balloon)
+    ET.SubElement(devices, "memballoon", {"model": "none"})
+    interfaces = devices.findall("interface")
+    if len(interfaces) != len(BRIDGES):
+        raise ValueError(f"expected {len(BRIDGES)} interfaces, found {len(interfaces)}")
+    for index, (interface, (label, _bridge)) in enumerate(zip(interfaces, BRIDGES)):
+        mac = interface.find("mac")
+        if mac is None:
+            mac = ET.SubElement(interface, "mac")
+        mac.set("address", f"52:54:00:84:00:{index + 1:02x}")
+        driver = interface.find("driver")
+        if driver is None:
+            driver = ET.SubElement(interface, "driver")
+        driver.attrib.update({"name": "vhost", "queues": "1"})
+        alias = interface.find("alias")
+        if alias is None:
+            alias = ET.SubElement(interface, "alias")
+        alias.set("name", "ua-mx84-" + label.lower())
+        if label.startswith("SFP"):
+            ET.SubElement(interface, "link", {"state": "down"})
+    return ET.tostring(root, encoding="unicode")
+
+
+def cleanup_failed_disk(disk, created, domain_defined):
+    if created and not domain_defined:
+        disk.unlink(missing_ok=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("iso", type=Path)
+    parser.add_argument("sha256")
+    args = parser.parse_args()
+    if os.geteuid() != 0:
+        parser.error("must run as root")
+    if not COMMISSIONED.exists():
+        parser.error("MX84 network is not commissioned")
+    if not args.iso.is_file() or sha256(args.iso) != args.sha256.lower():
+        parser.error("installer ISO is missing or its SHA-256 does not match")
+    if DISK.exists():
+        parser.error(f"refusing to overwrite existing disk: {DISK}")
+    if subprocess.run(["virsh", "--connect", "qemu:///system", "dominfo", "pfsense"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        parser.error("pfsense domain already exists")
+    missing = [bridge for _label, bridge in BRIDGES if not (Path("/sys/class/net") / bridge).exists()]
+    if missing:
+        parser.error("missing bridges: " + ", ".join(missing))
+
+    run(["/usr/sbin/mx84-port", "verify"])
+    DISK.parent.mkdir(parents=True, exist_ok=True)
+    disk_created = False
+    domain_defined = False
+    definition = None
+    try:
+        run(["qemu-img", "create", "-f", "qcow2", str(DISK), "32G"])
+        disk_created = True
+        command = [
+            "virt-install", "--connect", "qemu:///system", "--name", "pfsense",
+            "--memory", "2048", "--vcpus", "2", "--cpu", "host", "--machine", "q35",
+            "--boot", "uefi,firmware.feature0.name=secure-boot,firmware.feature0.enabled=no,firmware.feature1.name=enrolled-keys,firmware.feature1.enabled=no",
+            "--disk", f"path={DISK},format=qcow2,bus=virtio,cache=none,io=native",
+            "--cdrom", str(args.iso), "--osinfo", "detect=on,require=off",
+            "--graphics", "none", "--console", "pty,target.type=serial",
+            "--noautoconsole", "--print-xml=1",
+        ]
+        for _index, (_label, bridge) in enumerate(BRIDGES):
+            command.extend(["--network", f"bridge={bridge},model=virtio"])
+        xml = run(command, stdout=subprocess.PIPE).stdout
+        with tempfile.NamedTemporaryFile("w", suffix=".xml", delete=False) as output:
+            output.write(customize_xml(xml))
+            definition = output.name
+        run(["virsh", "--connect", "qemu:///system", "define", definition])
+        domain_defined = True
+        run(["virsh", "--connect", "qemu:///system", "autostart", "--disable", "pfsense"])
+        run(["systemctl", "start", "mx84-pfsense.service"])
+    except Exception:
+        cleanup_failed_disk(DISK, disk_created, domain_defined)
+        raise
+    finally:
+        if definition:
+            Path(definition).unlink(missing_ok=True)
+    print("pfsense defined with 2 vCPU, 2048 MiB fixed RAM, 32 GiB qcow2, and vtnet0-vtnet12 in documented order")
+
+
+if __name__ == "__main__":
+    main()

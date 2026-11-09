@@ -1,0 +1,18 @@
+[Unit]
+Description=MX84 pfSense VM
+Requires=mx84-platform-ready.service
+Wants=libvirtd.service
+After=mx84-platform-ready.service libvirtd.service
+ConditionPathExists=/var/lib/mx84-platform/network-commissioned
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/lib/mx84-platform/mx84-platform-ready
+ExecStart=/usr/lib/mx84-platform/mx84-pfsense-start
+ExecStartPost=/usr/lib/mx84-platform/mx84-offloads
+ExecStop=/usr/bin/virsh shutdown pfsense
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

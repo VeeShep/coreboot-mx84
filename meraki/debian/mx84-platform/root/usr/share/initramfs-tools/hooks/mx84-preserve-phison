@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+case "${1:-}" in prereqs) exit 0 ;; esac
+. /usr/share/initramfs-tools/hook-functions
+copy_exec /usr/sbin/blockdev /usr/sbin/blockdev
+mkdir -p "$DESTDIR/usr/lib/udev/rules.d"
+cp /usr/lib/udev/rules.d/68-mx84-preserve-phison.rules "$DESTDIR/usr/lib/udev/rules.d/"

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+export LC_ALL=C
+
+state=$(virsh domstate pfsense)
+case "$state" in
+    running) exit 0 ;;
+    'shut off') exec virsh start pfsense ;;
+    *) echo "pfSense cannot start from state: $state" >&2; exit 1 ;;
+esac

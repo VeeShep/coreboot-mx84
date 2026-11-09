@@ -1,0 +1,15 @@
+[Unit]
+Description=MX84 commissioned isolated switch profile
+Requires=mx84-switch.service
+After=mx84-switch.service networking.service ssh.service
+Before=mx84-platform-ready.service mx84-pfsense.service
+ConditionPathExists=/var/lib/mx84-platform/network-commissioned
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/mx84-port reapply
+RemainAfterExit=yes
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

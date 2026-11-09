@@ -1,0 +1,335 @@
+#!/usr/bin/python3
+"""MX84 front-panel policy daemon.  Standard library only."""
+
+import collections
+import json
+import os
+import shlex
+import shutil
+import signal
+import runpy
+import ssl
+import subprocess
+import time
+import urllib.request
+import urllib.parse
+from pathlib import Path
+
+
+CONFIG = Path(os.environ.get("MX84_LED_CONFIG", "/etc/mx84/led.conf"))
+RUN = Path(os.environ.get("MX84_LED_RUN", "/run/mx84-led"))
+SYS = Path(os.environ.get("MX84_SYSFS", "/sys"))
+PROC = Path(os.environ.get("MX84_PROCFS", "/proc"))
+CLI = os.environ.get("MX84_LED_CLI", "/usr/sbin/mx84-led")
+stop = False
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def load_config(path=CONFIG):
+    values = {}
+    if path.exists():
+        for raw in path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+def atomic_write(path, text, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".new")
+    tmp.write_text(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def run(command, timeout=5):
+    return subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, timeout=timeout, check=False
+    )
+
+
+class CpuMeter:
+    def __init__(self, proc=PROC):
+        self.proc = proc
+        self.previous = None
+        self.samples = collections.deque(maxlen=5)
+
+    def sample(self):
+        fields = (self.proc / "stat").read_text().splitlines()[0].split()[1:]
+        ticks = [int(value) for value in fields]
+        idle = ticks[3] + (ticks[4] if len(ticks) > 4 else 0)
+        # guest and guest_nice are already included in user and nice.
+        total = sum(ticks[:8])
+        if self.previous:
+            total_delta = total - self.previous[0]
+            idle_delta = idle - self.previous[1]
+            usage = 0.0 if total_delta <= 0 else 100.0 * (total_delta - idle_delta) / total_delta
+            self.samples.append(max(0.0, min(100.0, usage)))
+        self.previous = total, idle
+        return sum(self.samples) / len(self.samples) if self.samples else 0.0
+
+
+class Led:
+    def __init__(self, cli=CLI):
+        self.cli = cli
+        self.last = {}
+
+    def set(self, *command):
+        command = tuple(str(item) for item in command)
+        channel = command[0] if command[0] in ("ha", "usb", "power") else "center"
+        if command == self.last.get(channel) and command != ("rainbow",):
+            return True
+        env = os.environ.copy()
+        env["MX84_LED_INTERNAL"] = "1"
+        result = subprocess.run(
+            [self.cli, *command], env=env, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=12, check=False
+        )
+        if result.returncode == 0:
+            self.last[channel] = command
+            return True
+        return False
+
+
+class UsbState:
+    def __init__(self, config, sysfs=SYS):
+        self.sysfs = sysfs
+        self.device = config.get("FRONT_USB_PATH", "UNVERIFIED")
+        self.last_io = None
+        self.active_until = 0.0
+        self.hold = float(config.get("USB_ACTIVITY_HOLD_SECONDS", "1.5"))
+
+    def classify(self, now):
+        if not self.device or self.device == "UNVERIFIED":
+            return "unverified", []
+        root = self.sysfs / "bus/usb/devices" / self.device
+        if not root.exists():
+            self.last_io = None
+            return "empty", []
+        blocks = sorted({path.name for path in root.glob("**/block/*")})
+        if not blocks:
+            self.last_io = None
+            return "device", []
+        io_total = 0
+        for block in blocks:
+            try:
+                fields = (self.sysfs / "class/block" / block / "stat").read_text().split()
+                io_total += int(fields[0]) + int(fields[4])
+            except (OSError, ValueError, IndexError):
+                pass
+        if self.last_io is not None and io_total != self.last_io:
+            self.active_until = now + self.hold
+        self.last_io = io_total
+        return ("active" if now < self.active_until else "storage"), blocks
+
+
+class PlatformState:
+    def __init__(self, config, sysfs=SYS):
+        self.config = config
+        self.sysfs = sysfs
+        self.started = time.monotonic()
+        self.api_failures = 0
+        self.last_api_check = 0.0
+        self.api_healthy = False
+        self.domain_last_state = None
+        self.domain_state_since = None
+        self.switch_backend = None
+
+    def service_active(self, name):
+        return run(["systemctl", "is-active", "--quiet", name]).returncode == 0
+
+    def critical_fault(self):
+        services = [item for item in self.config.get("CRITICAL_SERVICES", "mx84-switch.service").split(",") if item]
+        service_fault = any(not self.service_active(name) for name in services)
+        disk_fault = shutil.disk_usage("/").free / shutil.disk_usage("/").total < 0.1
+        reboot_required = Path("/var/run/reboot-required").exists()
+        switch_fault = Path("/run/mx84/switch-profile-failed").exists()
+        return service_fault or disk_fault or reboot_required or switch_fault
+
+    def infrastructure_ready(self):
+        bridges = [item for item in self.config.get("REQUIRED_BRIDGES", "").split(",") if item]
+        return not self.critical_fault() and all((self.sysfs / "class/net" / bridge).exists() for bridge in bridges)
+
+    def domain_state(self):
+        name = self.config.get("PFSENSE_DOMAIN", "pfsense")
+        result = run(["virsh", "domstate", name])
+        return result.stdout.strip().lower() if result.returncode == 0 else "absent"
+
+    def commissioned(self):
+        return Path(self.config.get("PFSENSE_COMMISSIONED", "/var/lib/mx84-platform/pfsense-commissioned")).exists()
+
+    def domain_in_start_grace(self, state, now):
+        if state != self.domain_last_state:
+            self.domain_last_state = state
+            self.domain_state_since = now
+        grace = float(self.config.get("PFSENSE_START_GRACE_SECONDS", "180"))
+        return now - self.domain_state_since < grace
+
+    def check_api(self, now):
+        interval = float(self.config.get("API_CHECK_SECONDS", "5"))
+        if now - self.last_api_check < interval:
+            return self.api_healthy
+        self.last_api_check = now
+        credentials = load_config(Path(self.config.get("PFREST_CONFIG", "/etc/mx84/pfrest.conf")))
+        url = credentials.get("API_URL", "")
+        key = credentials.get("API_KEY", "")
+        header = credentials.get("API_HEADER", "X-API-Key")
+        try:
+            if not url or not key:
+                raise ValueError("pfREST credentials are not commissioned")
+            endpoint = urllib.parse.urlsplit(url)
+            if endpoint.scheme != "https" or endpoint.path.rstrip("/") != "/api/v2/status/system":
+                raise ValueError("pfREST health requires the HTTPS system-status endpoint")
+            request = urllib.request.Request(url, headers={header: key, "Accept": "application/json"})
+            ca_file = credentials.get("API_CA", "")
+            context = ssl.create_default_context(cafile=ca_file or None)
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=context), NoRedirect()
+            )
+            with opener.open(request, timeout=3) as response:
+                payload = json.load(response)
+                healthy = (
+                    response.status == 200 and isinstance(payload, dict)
+                    and payload.get("code") == 200 and payload.get("status") == "ok"
+                    and isinstance(payload.get("data"), dict)
+                    and {"uptime", "cpu_count"} <= payload["data"].keys()
+                )
+        except Exception:
+            healthy = False
+        if healthy:
+            self.api_failures = 0
+        else:
+            self.api_failures += 1
+        self.api_healthy = healthy
+        return healthy
+
+    def management(self):
+        interface = self.config.get("MANAGEMENT_INTERFACE", "mgmt0")
+        if self.critical_fault():
+            return "fault"
+        try:
+            # I354 carrier describes the CPU uplink, not the physical MGMT jack.
+            if self.switch_backend is None:
+                self.switch_backend = runpy.run_path("/usr/lib/mx84-platform/mx84-switch-backend")
+            physical = self.switch_backend["load_config"]("/etc/mx84/ports.conf")
+            if not self.switch_backend["read_carrier"](physical["MGMT"]):
+                return "no-carrier"
+            address = run(["ip", "-4", "-o", "addr", "show", "dev", interface])
+        except Exception:
+            return "fault"
+        if address.returncode != 0:
+            return "fault"
+        return "healthy" if address.stdout.strip() else "no-dhcp"
+
+
+def center_policy(platform, cpu, override, now):
+    if override:
+        return "manual", shlex.split(override)
+    boot_max = float(platform.config.get("BOOT_RAINBOW_SECONDS", "90"))
+    if now - platform.started < boot_max and not platform.infrastructure_ready():
+        return "boot", ["rainbow"]
+    if platform.critical_fault():
+        return "fault", ["hex", "FFFF00"]
+    if not platform.commissioned():
+        return "uncommissioned", ["green"]
+    domain = platform.domain_state()
+    in_start_grace = platform.domain_in_start_grace(domain, now)
+    if domain != "running":
+        platform.api_healthy = False
+        platform.api_failures = 0
+        if in_start_grace:
+            return "pfsense-starting", ["green"]
+        return "pfsense-stopped", ["hex", "FFFF00"]
+    if not platform.check_api(now):
+        if in_start_grace:
+            return "pfsense-starting", ["green"]
+        if platform.api_failures >= 3:
+            return "api-fault", ["hex", "FFFF00"]
+        return "api-checking", ["green"]
+    red = round(255 * cpu / 100)
+    return "online", ["rgb", str(red), "0", str(255 - red)]
+
+
+def read_override():
+    try:
+        return (RUN / "override").read_text().strip()
+    except OSError:
+        return ""
+
+
+def write_status(center, automatic_center, override, cpu, platform, management, usb, blocks):
+    fields = {
+        "automation": "active",
+        "center_state": center,
+        "automatic_center_state": automatic_center,
+        "override": override or "none",
+        "cpu_five_second_percent": f"{cpu:.1f}",
+        "pfsense_api_healthy": str(platform.api_healthy).lower(),
+        "pfsense_api_failures": str(platform.api_failures),
+        "management": management,
+        "usb": usb,
+        "usb_blocks": ",".join(blocks) or "none",
+    }
+    atomic_write(RUN / "status", "".join(f"{key}={value}\n" for key, value in fields.items()))
+
+
+def handle_stop(_signum, _frame):
+    global stop
+    stop = True
+
+
+def main():
+    config = load_config()
+    RUN.mkdir(parents=True, exist_ok=True)
+    atomic_write(RUN / "daemon.pid", f"{os.getpid()}\n")
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+    led = Led()
+    cpu_meter = CpuMeter()
+    usb_state = UsbState(config)
+    platform = PlatformState(config)
+    manual_active = False
+    try:
+        while not stop:
+            now = time.monotonic()
+            cpu = cpu_meter.sample()
+            automatic_center, automatic_command = center_policy(platform, cpu, "", now)
+            override = read_override()
+            management = platform.management()
+            usb, blocks = usb_state.classify(now)
+            if override:
+                manual_active = True
+                try:
+                    command = shlex.split(override)
+                    if not command:
+                        raise ValueError
+                except ValueError:
+                    center = "manual-invalid"
+                    led.set("hex", "FFFF00")
+                else:
+                    center = "manual"
+                    led.set(*command)
+            else:
+                if manual_active:
+                    led.last.clear()
+                    manual_active = False
+                center = automatic_center
+                led.set(*automatic_command)
+                led.set("ha", {"fault": "both", "no-carrier": "off", "no-dhcp": "orange", "healthy": "green"}[management])
+                led.set("usb", {"empty": "off", "device": "orange", "storage": "green", "active": "both", "unverified": "off"}[usb])
+            write_status(center, automatic_center, override, cpu, platform, management, usb, blocks)
+            time.sleep(1)
+    finally:
+        (RUN / "daemon.pid").unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    main()

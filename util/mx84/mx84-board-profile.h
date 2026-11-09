@@ -1,0 +1,36 @@
+#ifndef MX84_BOARD_PROFILE_H
+#define MX84_BOARD_PROFILE_H
+
+#include <vtss_api.h>
+
+/* Recovered configuration facts only; see MESA_SWITCH_BRINGUP.md for provenance.
+ * This is not an initializer: PHY/reset/negotiation dependencies remain open.
+ * SFP labels (logical 11/12) still require physical acceptance. */
+static const vtss_port_mux_mode_t mx84_mux_mode = VTSS_PORT_MUX_MODE_2;
+
+static const struct {
+    int chip_port;
+    vtss_port_interface_t interface;
+    vtss_miim_controller_t miim_controller;
+    u8 miim_addr;
+} mx84_board_ports[] = {
+    { 0, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 0},
+    { 1, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 1},
+    { 2, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 2},
+    { 3, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 3},
+    { 4, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 4},
+    { 5, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 5},
+    { 6, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 6},
+    { 7, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 7},
+    { 8, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 8},
+    { 9, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 9},
+    {10, VTSS_PORT_INTERFACE_SGMII, VTSS_MIIM_CONTROLLER_0, 10},
+    {21, VTSS_PORT_INTERFACE_SERDES, VTSS_MIIM_CONTROLLER_NONE, 0xff},
+    {20, VTSS_PORT_INTERFACE_SERDES, VTSS_MIIM_CONTROLLER_NONE, 0xff},
+    {24, VTSS_PORT_INTERFACE_SERDES, VTSS_MIIM_CONTROLLER_NONE, 0xff},
+    {25, VTSS_PORT_INTERFACE_SERDES, VTSS_MIIM_CONTROLLER_NONE, 0xff},
+    {23, VTSS_PORT_INTERFACE_SERDES, VTSS_MIIM_CONTROLLER_NONE, 0xff},
+    {22, VTSS_PORT_INTERFACE_SERDES, VTSS_MIIM_CONTROLLER_NONE, 0xff},
+};
+
+#endif

@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MX84 bring-up <mx84@example.invalid>
+Date: Tue, 1 Sep 2026 23:30:00 -0500
+Subject: [PATCH] platform/x86: add the Meraki MX84 reset button
+
+The factory 3.18 kernel registers one active-low gpio-keys-polled input at
+gpio_ich offset 0.  Its board data labels the button "restore", reports
+KEY_RESTART, and polls every 60 ms.  Recreate that DMI-gated input alongside
+the existing LP5562 setup while deriving the legacy GPIO number from the
+chip's runtime base.
+---
+ drivers/platform/x86/meraki-mx84.c | 57 +++++++++++++++++++++++++++---
+ 1 file changed, 53 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/platform/x86/meraki-mx84.c b/drivers/platform/x86/meraki-mx84.c
+index 111111111111..222222222222 100644
+--- a/drivers/platform/x86/meraki-mx84.c
++++ b/drivers/platform/x86/meraki-mx84.c
+@@ -3,16 +3,20 @@
+ #include <linux/err.h>
+ #include <linux/gpio/driver.h>
+ #include <linux/gpio/machine.h>
++#include <linux/gpio_keys.h>
+ #include <linux/i2c.h>
+ #include <linux/init.h>
++#include <linux/input-event-codes.h>
+ #include <linux/leds.h>
+ #include <linux/module.h>
+ #include <linux/platform_data/leds-lp55xx.h>
++#include <linux/platform_device.h>
+ #include <linux/string.h>
+ 
+ #define MX84_LP5562_ADAPTER	"SMBus I801 adapter"
+ #define MX84_LP5562_ADDR	0x30
+ #define MX84_LED_ENABLE_GPIO	35
++#define MX84_RESET_GPIO		0
+ 
+ static struct lp55xx_led_config mx84_leds[] = {
+ 	{ .name = "tricolor0:red",   .chan_nr = 0, .led_current = 150, .max_current = 255 },
+@@ -31,8 +35,26 @@ static struct i2c_board_info mx84_led_info = {
+ 	I2C_BOARD_INFO("lp5562", MX84_LP5562_ADDR),
+ 	.platform_data = &mx84_led_pdata,
+ };
++
++static struct gpio_keys_button mx84_reset_button = {
++	.code = KEY_RESTART,
++	.gpio = -1,
++	.active_low = 1,
++	.desc = "restore",
++	.type = EV_KEY,
++};
++
++static const struct gpio_keys_platform_data mx84_reset_pdata = {
++	.buttons = &mx84_reset_button,
++	.nbuttons = 1,
++	.poll_interval = 60,
++	.rep = 1,
++	.name = "MX84 reset button",
++};
++
+ static struct gpio_desc *mx84_led_enable;
+ static struct i2c_client *mx84_led_client;
++static struct platform_device *mx84_reset_device;
+ 
+ static int mx84_find_i801_adapter(struct device *dev, void *data)
+ {
+@@ -57,12 +79,13 @@ static const struct dmi_system_id mx84_dmi_table[] __initconst = {
+ 	{}
+ };
+ 
+-static int __init mx84_led_init(void)
++static int __init mx84_board_init(void)
+ {
+ 	struct gpio_device *gdev;
+ 	struct gpio_desc *enable;
+ 	struct i2c_adapter *adapter;
+ 	struct i2c_client *client;
++	struct platform_device *reset;
+ 	struct gpio_chip *chip;
+ 
+ 	if (!dmi_check_system(mx84_dmi_table)) {
+@@ -79,6 +102,12 @@ static int __init mx84_led_init(void)
+ 	}
+ 
+ 	chip = gpio_device_get_chip(gdev);
++	if (chip->base < 0 || MX84_RESET_GPIO >= chip->ngpio) {
++		pr_err("meraki-mx84: reset GPIO is outside gpio_ich\n");
++		gpio_device_put(gdev);
++		return -ENODEV;
++	}
++	mx84_reset_button.gpio = chip->base + MX84_RESET_GPIO;
+ 	enable = gpiochip_request_own_desc(chip, MX84_LED_ENABLE_GPIO,
+ 					   "master reset signal",
+ 					   GPIO_OPEN_DRAIN, GPIOD_OUT_HIGH);
+@@ -107,20 +136,34 @@ static int __init mx84_led_init(void)
+ 		return PTR_ERR(client);
+ 	}
+ 
++	reset = platform_device_register_data(NULL, "gpio-keys-polled",
++					      PLATFORM_DEVID_NONE,
++					      &mx84_reset_pdata,
++					      sizeof(mx84_reset_pdata));
++	if (IS_ERR(reset)) {
++		pr_err("meraki-mx84: failed to register reset button: %ld\n",
++		       PTR_ERR(reset));
++		i2c_unregister_device(client);
++		gpiochip_free_own_desc(enable);
++		return PTR_ERR(reset);
++	}
++
+ 	mx84_led_enable = enable;
+ 	mx84_led_client = client;
+-	pr_info("meraki-mx84: registered LP5562 status LED\n");
++	mx84_reset_device = reset;
++	pr_info("meraki-mx84: registered LP5562 status LED and reset button\n");
+ 	return 0;
+ }
+ 
+-static void __exit mx84_led_exit(void)
++static void __exit mx84_board_exit(void)
+ {
++	platform_device_unregister(mx84_reset_device);
+ 	i2c_unregister_device(mx84_led_client);
+ 	gpiochip_free_own_desc(mx84_led_enable);
+ }
+ 
+-late_initcall(mx84_led_init);
+-module_exit(mx84_led_exit);
++late_initcall(mx84_board_init);
++module_exit(mx84_board_exit);
+ 
+-MODULE_DESCRIPTION("Cisco Meraki MX84 status LED board support");
++MODULE_DESCRIPTION("Cisco Meraki MX84 status LED and reset-button board support");
+ MODULE_LICENSE("GPL");
+-- 
+2.51.0

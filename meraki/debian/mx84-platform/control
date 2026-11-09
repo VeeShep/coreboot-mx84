@@ -1,0 +1,11 @@
+Package: mx84-platform
+Version: @VERSION@
+Section: admin
+Priority: optional
+Architecture: all
+Maintainer: MX84 Project <mx84-project@users.noreply.github.com>
+Depends: python3, systemd, iproute2, ifupdown, ethtool, libvirt-clients, libvirt-daemon-system, qemu-system-x86, qemu-utils, ovmf, virtinst, initramfs-tools
+Description: Local Cisco Meraki MX84 platform integration
+ Safe front-panel automation, gated switch/port tooling, reset-button policy,
+ vendor-runtime installation, and direct-KVM prerequisites. Proprietary Meraki
+ files are intentionally excluded.

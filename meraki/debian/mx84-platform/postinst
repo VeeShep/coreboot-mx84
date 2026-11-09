@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+chmod 0600 /etc/mx84/pfrest.conf
+if id user >/dev/null 2>&1; then
+	for group in kvm libvirt; do
+		getent group "$group" >/dev/null 2>&1 && usermod -aG "$group" user
+	done
+fi
+deb-systemd-helper unmask mx84-switch.service mx84-led.service mx84-reset-button.service >/dev/null || true
+deb-systemd-helper enable mx84-switch.service mx84-led.service mx84-reset-button.service >/dev/null
+deb-systemd-invoke try-restart systemd-logind.service >/dev/null 2>&1 || true
+echo "mx84-platform installed; LED/reset services are enabled for next boot"
+echo "switch apply remains gated until ports.conf and the backend hash are verified"

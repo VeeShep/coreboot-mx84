@@ -1,0 +1,150 @@
+mx84-platform (0.1.20) unstable; urgency=medium
+
+  * Keep pfSense running across libvirtd maintenance restarts.
+  * Reuse an already running domain after readiness verification, and reject
+    paused/shutdown states rather than racing asynchronous guest shutdown.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Sun, 08 Nov 2026 12:30:00 -0600
+
+mx84-platform (0.1.19) unstable; urgency=medium
+
+  * Derive HA carrier from the mapped physical Management switch port instead
+    of the always-up I354 CPU uplink. Fail visibly on unavailable state.
+  * Bound vendor-control requests and retain timeout failures for recovery.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Sun, 08 Nov 2026 02:45:00 -0600
+
+mx84-platform (0.1.18) unstable; urgency=medium
+
+  * Clear cached API health when the VM stops so status cannot report stale
+    healthy API data during the stopped/startup LED grace period.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Sun, 08 Nov 2026 01:15:00 -0600
+
+mx84-platform (0.1.17) unstable; urgency=medium
+
+  * Keep the LED green during the VM's running-but-API-starting grace.
+  * Recheck network readiness on every pfSense service start.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Sun, 08 Nov 2026 01:00:00 -0600
+
+mx84-platform (0.1.16) unstable; urgency=medium
+
+  * Route WAN1 through eth0 and WAN2 through eth1 to respect vendor PVLANs.
+    Retain mgmt0 management and eth3 LAN/SFP paths, update link verification,
+    ownership, and rollback for all three router CPU trunks.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Sun, 08 Nov 2026 00:00:00 -0600
+
+mx84-platform (0.1.15) unstable; urgency=medium
+
+  * Disable guest Secure Boot and pre-enrolled keys explicitly for pfSense.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Sat, 07 Nov 2026 13:00:00 -0600
+
+mx84-platform (0.1.14) unstable; urgency=medium
+
+  * Request one installer XML document rather than both installation phases.
+    Use disk-first optical fallback and normal restart behavior for the
+    persistent guest, instead of the temporary installer's destroy-on-reboot.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Sat, 07 Nov 2026 12:30:00 -0600
+
+mx84-platform (0.1.13) unstable; urgency=medium
+
+  * Protect this unit's Phison by exact USB identity before LVM activation.
+    Include the rule and read-only tool in future initramfs builds.
+    Existing boot images require a rebuild before claiming protection.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Sat, 07 Nov 2026 12:00:00 -0600
+
+mx84-platform (0.1.12) unstable; urgency=medium
+
+  * Require the HTTPS system-status endpoint and pfREST success envelope with
+    status fields before reporting guest API health.
+  * Refuse API redirects so the key stays on the configured TLS endpoint.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Thu, 05 Nov 2026 13:00:00 -0600
+
+mx84-platform (0.1.11) unstable; urgency=medium
+
+  * Isolate router VLAN uplinks before flat recovery, close the boot-start
+    gate first, disable both guest autostart paths, and request guest shutdown.
+  * Refuse to flatten if a managed bridge contains an unexpected physical
+    member or a router uplink cannot be disconnected.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Thu, 05 Nov 2026 12:30:00 -0600
+
+mx84-platform (0.1.10) unstable; urgency=medium
+
+  * Verify the live network before allocating a pfSense disk; use system libvirt
+    explicitly and leave boot enablement until guest commissioning.
+  * Avoid double-counting KVM guest CPU ticks and reset the LED grace timer
+    when the domain returns to running.
+  * Give custom NIC aliases the required libvirt ua- prefix.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Thu, 05 Nov 2026 12:00:00 -0600
+
+mx84-platform (0.1.9) unstable; urgency=medium
+
+  * Report exact switch readback differences after a protected cutover.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Mon, 07 Sep 2026 18:05:00 -0500
+
+mx84-platform (0.1.8) unstable; urgency=medium
+
+  * Treat an intentional switch-service stop as a clean shutdown.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Mon, 07 Sep 2026 17:50:00 -0500
+
+mx84-platform (0.1.7) unstable; urgency=medium
+
+  * Remove only an attempt-owned pfSense disk when definition fails.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Mon, 07 Sep 2026 17:15:00 -0500
+
+mx84-platform (0.1.6) unstable; urgency=medium
+
+  * Verify bridge membership and host-address isolation before confirmation.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Mon, 07 Sep 2026 16:55:00 -0500
+
+mx84-platform (0.1.5) unstable; urgency=medium
+
+  * Add a config-gated management return route with flat-rollback cleanup.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Mon, 07 Sep 2026 16:30:00 -0500
+
+mx84-platform (0.1.4) unstable; urgency=medium
+
+  * Record the physically verified reset-button input path and KEY_RESTART code.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Mon, 07 Sep 2026 13:25:00 -0500
+
+mx84-platform (0.1.3) unstable; urgency=medium
+
+  * Record the physically verified front and internal USB topology paths.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Mon, 07 Sep 2026 13:10:00 -0500
+
+mx84-platform (0.1.2) unstable; urgency=medium
+
+  * Require root in the switch backend's direct apply and flat write modes.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Wed, 02 Sep 2026 12:30:00 -0500
+
+mx84-platform (0.1.1) unstable; urgency=medium
+
+  * Add the evidence-backed VSC7425 VLAN apply, readback, and flat rollback
+    backend while retaining physical-mapping and hash activation gates.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Wed, 02 Sep 2026 12:00:00 -0500
+
+mx84-platform (0.1.0) unstable; urgency=medium
+
+  * Add fail-closed switch mapping and rollback tooling.
+  * Add automatic center, USB, and HA LED policy.
+  * Add a gated two-second reset-button reboot handler.
+  * Add proprietary-runtime separation and direct-KVM dependencies.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Tue, 01 Sep 2026 20:50:00 -0500

@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+[ ! -e /run/mx84/switch-profile-failed ]
+[ -e /var/lib/mx84-platform/network-commissioned ] || {
+	echo "MX84 isolated network is not commissioned; pfSense remains gated" >&2
+	exit 1
+}
+/usr/sbin/mx84-port verify >/dev/null

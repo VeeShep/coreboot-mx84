@@ -1,0 +1,66 @@
+#!/bin/sh
+set -eu
+
+vendor=/opt/mx84/vendor
+root=$vendor/rootfs
+loader=$root/lib/ld-musl-x86_64.so.1
+daemon=$root/usr/sbin/vtss_poca_d
+ctlbin=$root/usr/sbin/vtssctl
+export LD_LIBRARY_PATH=$root/usr/lib:$root/lib
+
+(cd "$vendor" && sha256sum -c --quiet SHA256SUMS)
+
+name_interface()
+{
+	pci=$1
+	wanted=$2
+	set -- /sys/bus/pci/devices/$pci/net/*
+	[ -e "$1" ] || { echo "MX84 interface $pci not found" >&2; exit 1; }
+	current=${1##*/}
+	if [ "$current" != "$wanted" ]; then
+		ip link set "$current" down
+		ip link set "$current" name "$wanted"
+	fi
+	ip link set "$wanted" up
+}
+
+ctl()
+{
+	"$loader" "$ctlbin" "$@"
+}
+
+name_interface 0000:00:14.0 eth0
+name_interface 0000:00:14.1 eth1
+name_interface 0000:00:14.2 mgmt0
+name_interface 0000:00:14.3 eth3
+
+"$loader" "$daemon" -d error -q &
+pid=$!
+cleanup()
+{
+	kill "$pid" 2>/dev/null || true
+	wait "$pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'trap - EXIT INT TERM HUP; cleanup; exit 0' INT TERM HUP
+
+ready=0
+i=0
+while [ "$i" -lt 200 ]; do
+	if ctl port read 2>/dev/null | grep -q "Port 13, state: 1Gfdx"; then
+		ready=1
+		break
+	fi
+	kill -0 "$pid" 2>/dev/null || exit 1
+	i=$((i + 1))
+	sleep 0.1
+done
+[ "$ready" -eq 1 ] || { echo "VSC7425 did not become ready" >&2; exit 1; }
+
+for port in 0 1 2 3 4 5 6 7 8 9 10 11 12; do
+	ctl linkneg "$port" auto >/dev/null
+done
+
+systemd-notify --ready --status="VSC7425 initialized; front ports enabled"
+wait "$pid"
+trap - EXIT INT TERM HUP

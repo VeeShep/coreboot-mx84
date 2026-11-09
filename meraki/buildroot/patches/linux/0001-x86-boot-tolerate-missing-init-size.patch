@@ -1,0 +1,35 @@
+From: MX84 bring-up project
+Subject: [PATCH] x86/boot: tolerate missing init_size from Cisco Miles
+
+Cisco's old Miles payload clears boot_params and does not copy the
+protocol-2.10 init_size field.  It does copy kernel_alignment.  This MX84
+kernel uses a 16 MiB alignment which is larger than its initialization area,
+so use that value when init_size is zero.
+
+Without the fallback the decompressor places its page tables over the loaded
+compressed kernel and resets before producing console output.
+
+---
+ arch/x86/boot/compressed/head_64.S | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/arch/x86/boot/compressed/head_64.S b/arch/x86/boot/compressed/head_64.S
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@ -157,7 +157,13 @@ SYM_FUNC_START(startup_32)
+ 1:
+ 
+ 	/* Target address to relocate to for decompression */
+-	addl	BP_init_size(%esi), %ebx
++	movl	BP_init_size(%esi), %eax
++	testl	%eax, %eax
++	jnz	.Lstartup32_have_init_size
++	/* Cisco Miles copies kernel_alignment but leaves init_size zero. */
++	movl	BP_kernel_alignment(%esi), %eax
++.Lstartup32_have_init_size:
++	addl	%eax, %ebx
+ 	subl	$ rva(_end), %ebx
+ 
+ /*
+-- 
+2.43.0

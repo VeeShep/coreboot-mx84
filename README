@@ -2,6 +2,21 @@
 coreboot README
 -------------------------------------------------------------------------------
 
+Cisco Meraki MX84 integration:
+  meraki/debian/mx84-platform/README.md  Debian switch, LED and KVM integration
+  meraki/debian/mx84-kmod/README.md      Kernel modules and DKMS
+  util/mx84/MESA_SWITCH_BRINGUP.md       Offline open-switch research
+  meraki/seabios/                       SeaBIOS payload build
+
+Conversation archives, site/network notes and appliance-specific identity files
+are local-only and excluded from this source repository. Configure the verified
+storage identity before building the Debian package. Cisco/Meraki runtime
+binaries and original storage images are not distributed here.
+
+Before firmware work, preserve matching SPI reads and recovery access. Retained
+stock recovery-slot bytes do not prove automatic dual-image fallback under
+SeaBIOS; a full-chip write can destroy preserved regions.
+
 coreboot is a Free Software project aimed at replacing the proprietary BIOS
 (firmware) found in most computers.  coreboot performs a little bit of
 hardware initialization and then executes additional boot logic, called a
@@ -95,4 +110,3 @@ were derived from other projects, other (GPL-compatible) licenses may apply.
 Please check the individual source files for details.
 
 This makes the resulting coreboot images licensed under the GPL, version 2.
-

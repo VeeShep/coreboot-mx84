@@ -1,0 +1,39 @@
+#!/usr/bin/python3
+"""Record the front USB topology without touching block devices."""
+
+import os
+import sys
+from pathlib import Path
+
+
+SYS = Path(os.environ.get("MX84_SYSFS", "/sys"))
+SNAPSHOT = Path(os.environ.get("MX84_USB_SNAPSHOT", "/run/mx84-usb-before"))
+
+
+def devices():
+    root = SYS / "bus/usb/devices"
+    return {path.name for path in root.iterdir() if ":" not in path.name and "-" in path.name}
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) == 2 else "help"
+    if command == "baseline":
+        SNAPSHOT.write_text("\n".join(sorted(devices())) + "\n")
+        print("baseline recorded; plug a device into the empty front USB port, then run mx84-usb-discover detect")
+        return 0
+    if command == "detect":
+        if not SNAPSHOT.exists():
+            print("run mx84-usb-discover baseline first", file=sys.stderr)
+            return 2
+        found = devices() - set(SNAPSHOT.read_text().splitlines())
+        if len(found) != 1:
+            print(f"expected exactly one new USB path, found {len(found)}: {', '.join(sorted(found)) or 'none'}", file=sys.stderr)
+            return 1
+        print(next(iter(found)))
+        return 0
+    print("usage: mx84-usb-discover baseline|detect", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

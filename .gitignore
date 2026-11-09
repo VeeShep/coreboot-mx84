@@ -1,0 +1,22 @@
+/meraki/buildroot/output/
+/meraki/seabios/output/
+/meraki/debian/mx84-platform/dist/
+__pycache__/
+*.pyc
+
+# Local desktop metadata and generated dependencies.
+.DS_Store
+._*
+/util/cbfstool/.dependencies
+
+# Local conversation history and appliance/network operational notes.
+/MX84_CONVERSATION_REGISTER.md
+/MX84_QUESTIONS_AND_ANSWERS.md
+/MX84_PROJECT_HISTORY.md
+/MX84_CHANGE_LEDGER.md
+/MX84_GOAL.md
+/MX84_RESUME_HANDOFF.md
+/MX84_BRINGUP.md
+
+# Per-appliance identity; use the public example when configuring another unit.
+/meraki/debian/mx84-platform/root/usr/lib/udev/rules.d/68-mx84-preserve-phison.rules

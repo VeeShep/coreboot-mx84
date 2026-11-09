@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+
+case "${1:-}" in
+	remove|purge)
+		deb-systemd-invoke try-restart systemd-logind.service >/dev/null 2>&1 || true
+		;;
+esac

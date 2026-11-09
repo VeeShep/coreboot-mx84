@@ -1,0 +1,1 @@
+00e15000:00e2ffff seabios_payload

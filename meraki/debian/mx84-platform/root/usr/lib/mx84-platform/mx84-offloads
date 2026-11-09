@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+attempt=0
+while :; do
+	devices=$(virsh domiflist pfsense | awk 'NR > 2 && $1 != "-" { print $1 }')
+	count=$(printf '%s\n' "$devices" | sed '/^$/d' | wc -l)
+	[ "$count" -eq 13 ] && break
+	[ "$attempt" -ge 50 ] && { echo "expected 13 pfSense host interfaces, found $count" >&2; exit 1; }
+	attempt=$((attempt + 1))
+	sleep 0.1
+done
+
+for name in $devices; do
+	ethtool -K "$name" rx off tx off tso off gso off gro off lro off >/dev/null 2>&1 || true
+	features=$(ethtool -k "$name") || { echo "cannot read offloads on $name" >&2; exit 1; }
+	if printf '%s\n' "$features" | grep -Eq '^(rx-checksumming|tx-checksumming|tcp-segmentation-offload|generic-segmentation-offload|generic-receive-offload|large-receive-offload): on'; then
+		echo "required offload remains enabled on $name" >&2
+		exit 1
+	fi
+done

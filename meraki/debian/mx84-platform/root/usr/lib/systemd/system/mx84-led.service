@@ -1,0 +1,15 @@
+[Unit]
+Description=MX84 automatic front-panel LEDs
+After=systemd-modules-load.service
+Before=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/mx84-ledd
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=mx84-led
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

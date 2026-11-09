@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MX84 bring-up <mx84@example.invalid>
+Date: Fri, 21 Aug 2026 20:05:00 -0500
+Subject: [PATCH] igb: allow MDIO ioctls on I354 backplane ports
+
+The MX84's VSC7425 switch is managed through the first I354 MAC's MDIO
+interface. Permit the existing MII ioctls on I354 backplane ports and use
+the controller's MDIC accessors directly because non-copper ports do not
+install PHY read/write callbacks.
+---
+ drivers/net/ethernet/intel/igb/igb_main.c | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index 111111111111..222222222222 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -9147,9 +9147,16 @@ static int igb_mii_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
+ {
+ 	struct igb_adapter *adapter = netdev_priv(netdev);
+ 	struct mii_ioctl_data *data = if_mii(ifr);
++	s32 (*read_reg)(struct e1000_hw *, u32, u16 *) = igb_read_phy_reg;
++	s32 (*write_reg)(struct e1000_hw *, u32, u16) = igb_write_phy_reg;
+ 
+-	if (adapter->hw.phy.media_type != e1000_media_type_copper)
+-		return -EOPNOTSUPP;
++	if (adapter->hw.phy.media_type != e1000_media_type_copper) {
++		if (adapter->hw.mac.type != e1000_i354)
++			return -EOPNOTSUPP;
++
++		read_reg = igb_read_phy_reg_82580;
++		write_reg = igb_write_phy_reg_82580;
++	}
+ 
+ 	switch (cmd) {
+ 	case SIOCGMIIPHY:
+@@ -9157,12 +9164,12 @@ static int igb_mii_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
+ 		data->phy_id = adapter->hw.phy.addr;
+ 		break;
+ 	case SIOCGMIIREG:
+-		if (igb_read_phy_reg(&adapter->hw, data->reg_num & 0x1F,
++		if (read_reg(&adapter->hw, data->reg_num & 0x1F,
+ 				     &data->val_out))
+ 			return -EIO;
+ 		break;
+ 	case SIOCSMIIREG:
+-		if (igb_write_phy_reg(&adapter->hw, data->reg_num & 0x1F,
++		if (write_reg(&adapter->hw, data->reg_num & 0x1F,
+ 				      data->val_in))
+ 			return -EIO;
+ 		break;
+-- 
+2.51.0

@@ -1,0 +1,3 @@
+# Match this unit's preserved internal USB by identity, never by /dev/sdX.
+ACTION=="add|change", SUBSYSTEM=="block", ATTRS{idVendor}=="13fe", ATTRS{idProduct}=="5200", ATTRS{serial}=="REPLACE_WITH_VERIFIED_SERIAL", ENV{MX84_PRESERVED_PHISON}="1", ENV{DM_UDEV_DISABLE_OTHER_RULES_FLAG}="1", ENV{UDISKS_IGNORE}="1"
+ENV{MX84_PRESERVED_PHISON}=="1", PROGRAM="/usr/sbin/blockdev --setro $devnode"

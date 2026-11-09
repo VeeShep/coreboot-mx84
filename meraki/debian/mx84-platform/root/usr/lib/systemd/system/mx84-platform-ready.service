@@ -1,0 +1,13 @@
+[Unit]
+Description=Verify MX84 switch profile before pfSense start
+Requires=mx84-network.service
+After=mx84-network.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/mx84-platform/mx84-platform-ready
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+
+if [ "${1:-}" = remove ]; then
+	deb-systemd-helper disable mx84-switch.service mx84-led.service mx84-reset-button.service >/dev/null || true
+fi

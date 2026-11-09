@@ -1,0 +1,288 @@
+#!/bin/sh
+set -eu
+
+leds=${MX84_LED_SYSFS:-/sys/class/leds}
+gpios=${MX84_GPIO_SYSFS:-/sys/class/gpio}
+run_dir=${MX84_LED_RUN:-/run/mx84-led}
+override_file="$run_dir/override"
+daemon_pid_file="$run_dir/daemon.pid"
+daemon_status_file="$run_dir/status"
+red="$leds/tricolor0:red/brightness"
+green="$leds/tricolor0:green/brightness"
+blue="$leds/tricolor0:blue/brightness"
+white="$leds/power:white/brightness"
+
+usage()
+{
+	cat >&2 <<'EOF'
+usage: mx84-led COMMAND
+
+Center: boot | rainbow | red | orange | green | blue | white | off
+        rgb R G B | hex RRGGBB
+Panel:  power orange|off
+        ha green|orange|both|off
+        usb green|orange|both|off
+Auto:   auto
+Other:  status | help
+EOF
+}
+
+require_root()
+{
+	[ "$(id -u)" -eq 0 ] || {
+		[ "${MX84_LED_TESTING:-0}" = 1 ] &&
+		[ "$leds" != /sys/class/leds ] &&
+		[ "$gpios" != /sys/class/gpio ] && return
+		echo "mx84-led must run as root (use su -)" >&2
+		exit 1
+	}
+}
+
+wait_for_leds()
+{
+	i=0
+	while [ ! -w "$red" ] || [ ! -w "$green" ] || [ ! -w "$blue" ]; do
+		[ "$i" -ge 50 ] && {
+			echo "MX84 center LED driver is not loaded" >&2
+			return 1
+		}
+		i=$((i + 1))
+		sleep 0.1
+	done
+}
+
+gpio_base()
+{
+	for chip in "$gpios"/gpiochip*; do
+		[ -r "$chip/label" ] || continue
+		[ "$(cat "$chip/label")" = gpio_ich ] || continue
+		printf '%s\n' "${chip##*gpiochip}"
+		return
+	done
+	echo "gpio_ich not found" >&2
+	return 1
+}
+
+set_gpio()
+{
+	base=$(gpio_base)
+	gpio=$((base + $1))
+	path="$gpios/gpio$gpio"
+	if [ ! -d "$path" ]; then
+		printf '%s' "$gpio" > "$gpios/export"
+		i=0
+		while [ ! -d "$path" ]; do
+			[ "$i" -ge 20 ] && return 1
+			i=$((i + 1))
+			sleep 0.05
+		done
+	fi
+	if [ "$2" -eq 1 ]; then
+		printf high > "$path/direction"
+	else
+		printf low > "$path/direction"
+	fi
+}
+
+gpio_value()
+{
+	base=$(gpio_base 2>/dev/null) || { printf unavailable; return; }
+	path="$gpios/gpio$((base + $1))/value"
+	[ -r "$path" ] && cat "$path" || printf unexported
+}
+
+set_pair()
+{
+	case "$3" in
+		green)  set_gpio "$2" 0; set_gpio "$1" 1 ;;
+		orange) set_gpio "$1" 0; set_gpio "$2" 1 ;;
+		both)   set_gpio "$1" 1; set_gpio "$2" 1 ;;
+		off)    set_gpio "$1" 0; set_gpio "$2" 0 ;;
+		*) usage; exit 2 ;;
+	esac
+}
+
+rgb()
+{
+	printf '%s' "$1" > "$red"
+	printf '%s' "$2" > "$green"
+	printf '%s' "$3" > "$blue"
+}
+
+is_byte()
+{
+	case "$1" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -le 255 ]
+}
+
+set_rgb()
+{
+	[ "$#" -eq 3 ] && is_byte "$1" && is_byte "$2" && is_byte "$3" || {
+		echo "RGB values must be decimal numbers from 0 through 255" >&2
+		exit 2
+	}
+	[ -w "$white" ] && printf 0 > "$white"
+	rgb "$1" "$2" "$3"
+}
+
+set_hex()
+{
+	hex=${1#\#}
+	printf '%s\n' "$hex" | grep -Eq '^[0-9A-Fa-f]{6}$' || {
+		echo "hex color must contain exactly six digits, for example FF5000" >&2
+		exit 2
+	}
+	rest=${hex#??}
+	set_rgb "$((0x${hex%????}))" "$((0x${rest%??}))" "$((0x${hex#????}))"
+}
+
+set_white()
+{
+	rgb 0 0 0
+	[ -w "$white" ] && printf '%s' "$1" > "$white"
+}
+
+daemon_running()
+{
+	[ -r "$daemon_pid_file" ] || return 1
+	pid=$(cat "$daemon_pid_file" 2>/dev/null) || return 1
+	case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+	kill -0 "$pid" 2>/dev/null
+}
+
+set_override()
+{
+	mkdir -p "$run_dir"
+	tmp="$override_file.$$"
+	printf '%s\n' "$*" > "$tmp"
+	mv "$tmp" "$override_file"
+	printf 'manual override: %s (run mx84-led auto to resume automation)\n' "$*"
+}
+
+rainbow()
+{
+	[ -w "$white" ] && printf 0 > "$white"
+	cycle=0
+	while [ "$cycle" -lt 2 ]; do
+		i=0
+		while [ "$i" -le 255 ]; do rgb 255 "$i" 0; sleep 0.03; i=$((i + 17)); done
+		i=0
+		while [ "$i" -le 255 ]; do rgb $((255 - i)) 255 0; sleep 0.03; i=$((i + 17)); done
+		i=0
+		while [ "$i" -le 255 ]; do rgb 0 255 "$i"; sleep 0.03; i=$((i + 17)); done
+		i=0
+		while [ "$i" -le 255 ]; do rgb 0 $((255 - i)) 255; sleep 0.03; i=$((i + 17)); done
+		i=0
+		while [ "$i" -le 255 ]; do rgb "$i" 0 255; sleep 0.03; i=$((i + 17)); done
+		i=0
+		while [ "$i" -le 255 ]; do rgb 255 0 $((255 - i)); sleep 0.03; i=$((i + 17)); done
+		cycle=$((cycle + 1))
+	done
+}
+
+status()
+{
+	if [ -r "$daemon_status_file" ]; then
+		cat "$daemon_status_file"
+	else
+		echo "automation=inactive"
+	fi
+	if [ -r "$override_file" ]; then
+		printf 'override=%s\n' "$(cat "$override_file")"
+	else
+		echo "override=none"
+	fi
+	if [ -r "$red" ] && [ -r "$green" ] && [ -r "$blue" ]; then
+		printf 'center rgb=%s,%s,%s white=%s\n' \
+			"$(cat "$red")" "$(cat "$green")" "$(cat "$blue")" \
+			"$([ -r "$white" ] && cat "$white" || echo unavailable)"
+	else
+		echo "center unavailable"
+	fi
+	printf 'power-orange raw=%s (0=on, 1=off)\n' "$(gpio_value 59)"
+	printf 'ha green=%s orange=%s\n' "$(gpio_value 50)" "$(gpio_value 58)"
+	printf 'usb green=%s orange=%s\n' "$(gpio_value 39)" "$(gpio_value 40)"
+}
+
+command=${1:-help}
+case "$command" in
+	status) status; exit ;;
+	help|-h|--help) usage; exit ;;
+	auto)
+		require_root
+		[ "$#" -eq 1 ] || { usage; exit 2; }
+		rm -f "$override_file"
+		echo "automatic LED control enabled"
+		exit
+		;;
+	power)
+		require_root
+		[ "$#" -eq 2 ] || { usage; exit 2; }
+		if [ "${MX84_LED_INTERNAL:-0}" != 1 ] && daemon_running; then
+			case "$2" in orange|off) set_override "$command" "$2" ;; *) usage; exit 2 ;; esac
+			exit
+		fi
+		case "$2" in orange) set_gpio 59 0 ;; off) set_gpio 59 1 ;; *) usage; exit 2 ;; esac
+		exit
+		;;
+	ha|usb)
+		require_root
+		[ "$#" -eq 2 ] || { usage; exit 2; }
+		if [ "${MX84_LED_INTERNAL:-0}" != 1 ] && daemon_running; then
+			case "$2" in green|orange|both|off) set_override "$command" "$2" ;; *) usage; exit 2 ;; esac
+			exit
+		fi
+		[ "$command" = ha ] && set_pair 50 58 "$2" || set_pair 39 40 "$2"
+		exit
+		;;
+esac
+
+require_root
+
+if [ "${MX84_LED_INTERNAL:-0}" != 1 ] && daemon_running; then
+	case "$command" in
+		boot|rainbow|red|orange|green|blue|white|off)
+			[ "$#" -eq 1 ] || { usage; exit 2; }
+			set_override "$command"
+			exit
+			;;
+		rgb)
+			shift
+			[ "$#" -eq 3 ] && is_byte "$1" && is_byte "$2" && is_byte "$3" || {
+				echo "RGB values must be decimal numbers from 0 through 255" >&2
+				exit 2
+			}
+			set_override rgb "$@"
+			exit
+			;;
+		hex)
+			[ "$#" -eq 2 ] || { usage; exit 2; }
+			hex=${2#\#}
+			printf '%s\n' "$hex" | grep -Eq '^[0-9A-Fa-f]{6}$' || {
+				echo "hex color must contain exactly six digits, for example FF5000" >&2
+				exit 2
+			}
+			set_override hex "$hex"
+			exit
+			;;
+	esac
+fi
+
+wait_for_leds
+set_gpio 59 1
+
+case "$command" in
+	boot) rainbow; set_rgb 0 255 0 ;;
+	rainbow) [ "$#" -eq 1 ] || { usage; exit 2; }; rainbow ;;
+	red) set_rgb 255 0 0 ;;
+	orange) set_rgb 255 96 0 ;;
+	green) set_rgb 0 255 0 ;;
+	blue) set_rgb 0 0 255 ;;
+	white) set_white 255 ;;
+	off) set_white 0 ;;
+	rgb) shift; set_rgb "$@" ;;
+	hex) [ "$#" -eq 2 ] || { usage; exit 2; }; set_hex "$2" ;;
+	*) usage; exit 2 ;;
+esac

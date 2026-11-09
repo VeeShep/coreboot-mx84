@@ -1,0 +1,348 @@
+#!/usr/bin/python3
+"""Apply and verify the MX84 VSC7425 VLAN profile through preserved vtssctl."""
+
+import configparser
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+LABELS = ["MGMT", "WAN1", "WAN2", *(f"LAN{i}" for i in range(1, 9)), "SFP1", "SFP2"]
+COPPER = LABELS[:11]
+ROUTER = LABELS[1:]
+EXPECTED_VLANS = {
+    "MGMT": 399,
+    "WAN1": 101,
+    "WAN2": 102,
+    **{f"LAN{i}": 200 + i for i in range(1, 9)},
+    "SFP1": 301,
+    "SFP2": 302,
+}
+FRONT_PORTS = range(13)
+ALL_PORTS = range(17)
+MANAGEMENT_CPU_PORT = 15
+CPU_PORTS = {"MGMT": 15, "WAN1": 13, "WAN2": 14}
+VENDOR = Path("/opt/mx84/vendor")
+_vendor_verified = False
+
+
+class BackendError(RuntimeError):
+    pass
+
+
+def verify_vendor():
+    global _vendor_verified
+    if _vendor_verified:
+        return
+    manifest = VENDOR / "SHA256SUMS"
+    try:
+        lines = manifest.read_text().splitlines()
+    except OSError as error:
+        raise BackendError(f"cannot read vendor manifest: {error}") from error
+    if not lines:
+        raise BackendError("vendor manifest is empty")
+    root = VENDOR.resolve()
+    for line in lines:
+        match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+        if not match:
+            raise BackendError("invalid vendor manifest entry")
+        expected, relative = match.groups()
+        path = VENDOR / relative
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            raise BackendError(f"missing vendor file: {relative}") from error
+        if root not in resolved.parents or not resolved.is_file():
+            raise BackendError(f"unsafe vendor manifest path: {relative}")
+        if hashlib.sha256(resolved.read_bytes()).hexdigest() != expected:
+            raise BackendError(f"vendor hash mismatch: {relative}")
+    _vendor_verified = True
+
+
+def ctl(*arguments):
+    verify_vendor()
+    root = VENDOR / "rootfs"
+    loader = root / "lib/ld-musl-x86_64.so.1"
+    binary = root / "usr/sbin/vtssctl"
+    environment = os.environ.copy()
+    environment["LD_LIBRARY_PATH"] = f"{root}/usr/lib:{root}/lib"
+    try:
+        result = subprocess.run(
+            [str(loader), str(binary), *map(str, arguments)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise BackendError(f"vendor control request failed: {error}") from error
+    output = result.stdout + result.stderr
+    returns = re.findall(r"(?m)^ret:\s*(-?\d+)\s*$", output)
+    if result.returncode or returns != ["0"]:
+        command = " ".join(map(str, arguments))
+        detail = output.strip() or f"process exit {result.returncode}"
+        raise BackendError(f"vtssctl {command} failed: {detail}")
+    return output
+
+
+def load_config(path):
+    config = configparser.ConfigParser()
+    if not config.read(path):
+        raise BackendError(f"cannot read {path}")
+    if "platform" not in config or any(label not in config for label in LABELS):
+        raise BackendError("ports configuration is incomplete")
+    platform = config["platform"]
+    if not platform.getboolean("mapping_verified", fallback=False):
+        raise BackendError("physical mapping is not verified")
+    if not platform.getboolean("cpu_mapping_verified", fallback=False):
+        raise BackendError("CPU mapping is not verified")
+    if platform.get("trunk_interface") != "eth3" or platform.get("management_interface") != "mgmt0":
+        raise BackendError("unexpected CPU-interface mapping")
+
+    physical = {}
+    used = set()
+    for label in LABELS:
+        section = config[label]
+        if section.getint("vlan") != EXPECTED_VLANS[label]:
+            raise BackendError(f"unexpected VLAN for {label}")
+        expected_cpu = {"MGMT": "mgmt0", "WAN1": "eth0", "WAN2": "eth1"}.get(label, "eth3")
+        if section.get("cpu_interface") != expected_cpu:
+            raise BackendError(f"unexpected CPU interface for {label}")
+        verified = section.getboolean("verified", fallback=False)
+        raw_port = section.get("vsc_port", "UNVERIFIED")
+        if label in COPPER and (not verified or raw_port == "UNVERIFIED"):
+            raise BackendError(f"copper mapping is unverified: {label}")
+        if not verified:
+            if raw_port != "UNVERIFIED":
+                raise BackendError(f"unverified port has a numeric mapping: {label}")
+            physical[label] = None
+            continue
+        try:
+            port = int(raw_port)
+        except ValueError as error:
+            raise BackendError(f"invalid VSC port for {label}") from error
+        if port not in FRONT_PORTS or port in used:
+            raise BackendError(f"invalid or duplicate VSC port for {label}")
+        used.add(port)
+        physical[label] = port
+    return physical
+
+
+def base_port_profile():
+    return {
+        "learn": "true",
+        "ifilt": "true",
+        "pvid": "1",
+        "uvid": "1",
+        "type": "VTSS_VLAN_PORT_TYPE_C",
+        "max_len": "1518",
+        "max_tags": "0",
+    }
+
+
+def flat_state():
+    profile = base_port_profile()
+    profile["ifilt"] = "false"
+    profile["type"] = "VTSS_VLAN_PORT_TYPE_UNAWARE"
+    return ({port: profile.copy() for port in ALL_PORTS}, {1: set(ALL_PORTS)})
+
+
+def desired_state(physical):
+    ports = {port: base_port_profile() for port in ALL_PORTS}
+    vlans = {}
+    for label, vlan in EXPECTED_VLANS.items():
+        # The vendor initializer also restricts forwarding through fixed PVLAN groups.
+        members = {CPU_PORTS.get(label, 16)}
+        if physical[label] is not None:
+            members.add(physical[label])
+            ports[physical[label]]["pvid"] = str(vlan)
+            ports[physical[label]]["uvid"] = str(vlan)
+        vlans[vlan] = members
+
+    ports[MANAGEMENT_CPU_PORT]["pvid"] = str(EXPECTED_VLANS["MGMT"])
+    ports[MANAGEMENT_CPU_PORT]["uvid"] = str(EXPECTED_VLANS["MGMT"])
+    for cpu in (13, 14, 16):
+        ports[cpu]["max_len"] = "1522"
+        ports[cpu]["max_tags"] = "1"
+    return ports, vlans
+
+
+def parse_members(text):
+    members = set()
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start, end = map(int, item.split("-", 1))
+            members.update(range(start, end + 1))
+        else:
+            members.add(int(item))
+    return members
+
+
+def read_vlans():
+    found = {}
+    output = ctl("vlan", "read")
+    for match in re.finditer(r"(?m)^VLAN:\s*(\d+)\s+members:\s*([^\r\n]*)$", output):
+        found[int(match.group(1))] = parse_members(match.group(2))
+    return found
+
+
+def read_port(port):
+    output = ctl("port", port, "read")
+    pattern = (
+        rf"Port {port}, state: .*?, ifilt: (true|false), PVID: (\d+), UVID: (\d+), "
+        r"tags: [^,]+, learn: (true|false), type: ([A-Z0-9_]+), "
+        r"max_len: (\d+), max_tags: (\d+)"
+    )
+    match = re.search(pattern, output)
+    if not match:
+        raise BackendError(f"cannot parse port {port} readback")
+    ifilt, pvid, uvid, learn, port_type, max_len, max_tags = match.groups()
+    return {
+        "learn": learn,
+        "ifilt": ifilt,
+        "pvid": pvid,
+        "uvid": uvid,
+        "type": port_type,
+        "max_len": max_len,
+        "max_tags": max_tags,
+    }
+
+
+def read_carrier(port):
+    if port not in FRONT_PORTS:
+        raise BackendError("carrier requires a physical front port")
+    output = ctl("port", port, "read")
+    match = re.search(rf"Port {port}, state: ([^,]+),", output)
+    state = match.group(1).strip().lower() if match else ""
+    if state in {"down", "discon"}:
+        return False
+    if re.fullmatch(r"(?:10m|100m|1g)[fh]dx", state):
+        return True
+    raise BackendError(f"unknown carrier state for physical port {port}")
+
+
+def state_differences(expected_ports, expected_vlans):
+    differences = []
+    actual_vlans = read_vlans()
+    if actual_vlans != expected_vlans:
+        differences.append(f"VLANs expected {expected_vlans}, got {actual_vlans}")
+    for port in ALL_PORTS:
+        actual = read_port(port)
+        if actual != expected_ports[port]:
+            differences.append(f"port {port} expected {expected_ports[port]}, got {actual}")
+    return differences
+
+
+def state_matches(expected_ports, expected_vlans):
+    return not state_differences(expected_ports, expected_vlans)
+
+
+def ranges(members):
+    ordered = sorted(members)
+    if not ordered:
+        return []
+    result = []
+    start = previous = ordered[0]
+    for port in ordered[1:]:
+        if port == previous + 1:
+            previous = port
+            continue
+        result.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = port
+    result.append(str(start) if start == previous else f"{start}-{previous}")
+    return result
+
+
+def add_vlans(vlans):
+    for vlan, members in sorted(vlans.items()):
+        for port_range in ranges(members):
+            ctl("vlan", vlan, port_range, "member")
+
+
+def write_ports(ports):
+    order = ("learn", "ifilt", "pvid", "uvid", "type", "max_len", "max_tags")
+    numeric_type = {
+        "VTSS_VLAN_PORT_TYPE_UNAWARE": "0",
+        "VTSS_VLAN_PORT_TYPE_C": "1",
+        "VTSS_VLAN_PORT_TYPE_S": "2",
+        "VTSS_VLAN_PORT_TYPE_S_CUSTOM": "3",
+    }
+    for port in ALL_PORTS:
+        for field in order:
+            value = ports[port][field]
+            if field == "type":
+                value = numeric_type[value]
+            ctl("port", port, field, value)
+
+
+def remove_other_vlans(keep):
+    for vlan in sorted(set(read_vlans()) - set(keep)):
+        ctl("vlan", vlan, "0-16", "nomember")
+
+
+def apply_profile(physical):
+    flat_ports, flat_vlans = flat_state()
+    wanted_ports, wanted_vlans = desired_state(physical)
+    if state_matches(wanted_ports, wanted_vlans):
+        return
+    if not state_matches(flat_ports, flat_vlans):
+        raise BackendError("refusing apply from an unknown switch state")
+    add_vlans(wanted_vlans)
+    write_ports(wanted_ports)
+    remove_other_vlans(wanted_vlans)
+    if not state_matches(wanted_ports, wanted_vlans):
+        raise BackendError("switch profile readback failed after apply")
+
+
+def restore_flat():
+    ports, vlans = flat_state()
+    errors = []
+    for action in (lambda: add_vlans(vlans), lambda: write_ports(ports), lambda: remove_other_vlans(vlans)):
+        try:
+            action()
+        except BackendError as error:
+            errors.append(str(error))
+    try:
+        verified = state_matches(ports, vlans)
+    except BackendError as error:
+        errors.append(str(error))
+        verified = False
+    if errors or not verified:
+        raise BackendError("flat recovery incomplete: " + "; ".join(errors or ["readback mismatch"]))
+
+
+def main():
+    if len(sys.argv) != 3 or sys.argv[1] not in {"apply", "verify", "flat"}:
+        raise SystemExit("usage: mx84-switch-backend apply|verify|flat PORTS_CONF")
+    command, config_path = sys.argv[1:]
+    if command in {"apply", "flat"} and os.geteuid() != 0:
+        raise SystemExit("mx84-switch-backend apply/flat requires root")
+    try:
+        if command == "flat":
+            restore_flat()
+            print("flat VLAN 1 recovery verified across VSC ports 0-16")
+            return
+        physical = load_config(config_path)
+        wanted_ports, wanted_vlans = desired_state(physical)
+        if command == "apply":
+            apply_profile(physical)
+            print("isolated switch profile applied and verified")
+        else:
+            differences = state_differences(wanted_ports, wanted_vlans)
+            if differences:
+                raise BackendError("isolated switch profile readback mismatch: " + "; ".join(differences))
+            print("isolated switch profile verified")
+    except BackendError as error:
+        print(f"mx84-switch-backend: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+
+
+if __name__ == "__main__":
+    main()

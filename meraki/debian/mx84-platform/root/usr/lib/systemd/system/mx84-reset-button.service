@@ -1,0 +1,13 @@
+[Unit]
+Description=MX84 two-second reset-button reboot handler
+After=systemd-udev-settle.service
+ConditionPathExists=/etc/mx84/reset-button.conf
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/mx84-reset-button
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

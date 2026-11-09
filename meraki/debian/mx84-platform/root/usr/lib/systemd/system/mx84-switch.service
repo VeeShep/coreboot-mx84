@@ -1,0 +1,18 @@
+[Unit]
+Description=Cisco Meraki MX84 VSC7425 switch
+Wants=systemd-udev-settle.service
+After=systemd-modules-load.service systemd-udev-settle.service
+Before=network-pre.target networking.service
+ConditionPathExists=/opt/mx84/vendor/rootfs/usr/sbin/vtss_poca_d
+
+[Service]
+Type=notify
+NotifyAccess=all
+ExecStart=/usr/sbin/mx84-switch
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=45
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

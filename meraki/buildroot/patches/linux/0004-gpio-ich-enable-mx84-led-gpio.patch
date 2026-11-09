@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: MX84 bring-up <mx84@example.invalid>
+Date: Fri, 21 Aug 2026 22:15:00 -0500
+Subject: [PATCH] gpio: gpio-ich: enable the MX84 LED GPIO on request
+
+Coreboot leaves the MX84's SUS GPIO3 in native-function mode, while the
+factory board setup expects GPIO offset 35 to control the LP5562 reset line.
+Switch that one pin to GPIO mode when the DMI-gated MX84 board driver requests
+it.  Other pins and systems retain the generic driver's firmware-owned muxing.
+---
+ drivers/gpio/gpio-ich.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/drivers/gpio/gpio-ich.c b/drivers/gpio/gpio-ich.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpio/gpio-ich.c
++++ b/drivers/gpio/gpio-ich.c
+@@ -6,6 +6,7 @@
+  */
+ 
+ #include <linux/bitops.h>
++#include <linux/dmi.h>
+ #include <linux/gpio/driver.h>
+ #include <linux/ioport.h>
+ #include <linux/mfd/lpc_ich.h>
+@@ -221,11 +222,24 @@ static int ichx_gpio_get(struct gpio_chip *chip, unsigned int nr)
+ 	}
+ }
+ 
++static const struct dmi_system_id mx84_dmi_table[] = {
++	{
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Cisco Meraki"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "MX84-HW"),
++		},
++	},
++	{}
++};
++
+ static int ichx_gpio_request(struct gpio_chip *chip, unsigned int nr)
+ {
+ 	if (!ichx_gpio_check_available(chip, nr))
+ 		return -ENXIO;
+ 
++	if (nr == 35 && dmi_check_system(mx84_dmi_table))
++		ichx_write_bit(GPIO_USE_SEL, nr, 1, 0);
++
+ 	/*
+ 	 * Note we assume the BIOS properly set a bridge's USE value.  Some
+ 	 * chips (eg Intel 3100) have bogus USE values though, so first see if
+-- 
+2.51.0

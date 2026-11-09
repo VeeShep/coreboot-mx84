@@ -1,0 +1,556 @@
+#!/usr/bin/python3
+"""Safe MX84 chassis-port mapping and cutover entry point."""
+
+import configparser
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+CONFIG = Path(os.environ.get("MX84_PORT_CONFIG", "/etc/mx84/ports.conf"))
+SERIAL_MARKER = Path(os.environ.get("MX84_SERIAL_MARKER", "/run/mx84/serial-recovery-ready"))
+ROLLBACK_MARKER = Path(os.environ.get("MX84_ROLLBACK_MARKER", "/run/mx84/rollback-unit"))
+COMMISSIONED = Path(os.environ.get("MX84_NETWORK_COMMISSIONED", "/var/lib/mx84-platform/network-commissioned"))
+RECOVERY_INTERFACES = Path(os.environ.get("MX84_RECOVERY_INTERFACES", "/var/lib/mx84-platform/recovery-eth0.interfaces"))
+RECOVERY_INTERFACES_PATH = RECOVERY_INTERFACES.with_suffix(".path")
+OWNED_LINKS = Path(os.environ.get("MX84_OWNED_LINKS", "/var/lib/mx84-platform/network-links-owned"))
+TRUNK_MTU = Path(os.environ.get("MX84_TRUNK_MTU", "/var/lib/mx84-platform/recovery-trunk-mtu"))
+MGMT_CONFIG_OWNED = Path(os.environ.get("MX84_MGMT_CONFIG_OWNED", "/var/lib/mx84-platform/management-config-owned"))
+NETWORK_DIR = Path(os.environ.get("MX84_NETWORK_DIR", "/etc/network"))
+SYS_CLASS_NET = Path(os.environ.get("MX84_SYS_CLASS_NET", "/sys/class/net"))
+LABELS = ["MGMT", "WAN1", "WAN2", *(f"LAN{i}" for i in range(1, 9)), "SFP1", "SFP2"]
+COPPER = ["MGMT", "WAN1", "WAN2", *(f"LAN{i}" for i in range(1, 9))]
+
+
+def run(command, check=False, capture=False):
+    return subprocess.run(
+        command, check=check, text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+    )
+
+
+def load_config(path=CONFIG):
+    config = configparser.ConfigParser()
+    if not config.read(path):
+        raise SystemExit(f"cannot read {path}")
+    missing = [label for label in LABELS if label not in config]
+    if "platform" not in config or missing:
+        raise SystemExit(f"invalid ports configuration; missing: {', '.join(missing) or 'platform'}")
+    return config
+
+
+def bridge(label):
+    return "br-" + label.lower()
+
+
+def cpu_interface(config, label):
+    expected = {"WAN1": "eth0", "WAN2": "eth1"}.get(label, "eth3")
+    if label not in LABELS[1:] or config[label]["cpu_interface"] != expected:
+        raise SystemExit(f"refusing unexpected CPU interface for {label}")
+    return expected
+
+
+def router_trunks(config):
+    return sorted({cpu_interface(config, label) for label in LABELS[1:]})
+
+
+def uplink(config, label):
+    return f"{cpu_interface(config, label)}.{config[label]['vlan']}"
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise SystemExit("mx84-port apply/confirm/rollback requires root")
+
+
+def management_route_settings(config, required=True):
+    platform = config["platform"]
+    subnet = platform.get("management_client_subnet", "UNVERIFIED")
+    gateway = platform.get("management_gateway", "UNVERIFIED")
+    if "UNVERIFIED" in (subnet, gateway):
+        if required:
+            raise SystemExit("refusing: management client subnet or gateway is unverified")
+        return None
+    try:
+        network = ipaddress.ip_network(subnet)
+        next_hop = ipaddress.ip_address(gateway)
+    except ValueError as error:
+        if required:
+            raise SystemExit(f"refusing invalid management route: {error}") from error
+        return None
+    if network.version != 4 or network.prefixlen == 0 or next_hop.version != 4:
+        if required:
+            raise SystemExit("refusing: management route must be a non-default IPv4 network")
+        return None
+    return str(network), str(next_hop), platform.get("management_interface", "mgmt0")
+
+
+def configure_management_route(config):
+    subnet, gateway, interface = management_route_settings(config)
+    run(["ip", "route", "replace", subnet, "via", gateway, "dev", interface], check=True)
+
+
+def remove_management_route(config):
+    settings = management_route_settings(config, required=False)
+    if settings:
+        subnet, gateway, interface = settings
+        run(["ip", "route", "del", subnet, "via", gateway, "dev", interface], check=False)
+
+
+def validate(config, require_serial=False):
+    platform = config["platform"]
+    if platform.getboolean("mapping_verified", fallback=False) is not True:
+        raise SystemExit("refusing: physical port mapping is not verified")
+    if platform.getboolean("cpu_mapping_verified", fallback=False) is not True:
+        raise SystemExit("refusing: CPU-port mapping is not verified")
+    for label in COPPER:
+        if not config[label].getboolean("verified", fallback=False) or config[label]["vsc_port"] == "UNVERIFIED":
+            raise SystemExit(f"refusing: {label} is not physically verified")
+    vlans = [config[label].getint("vlan") for label in LABELS]
+    if len(vlans) != len(set(vlans)):
+        raise SystemExit("refusing: VLAN IDs are not unique")
+    management_route_settings(config)
+    if require_serial and not SERIAL_MARKER.exists():
+        raise SystemExit(f"refusing: serial recovery marker {SERIAL_MARKER} is absent")
+    backend = Path(platform["switch_backend"])
+    expected = platform.get("switch_backend_sha256", "UNVERIFIED")
+    if not backend.is_file() or not os.access(backend, os.X_OK) or expected == "UNVERIFIED":
+        raise SystemExit("refusing: verified switch backend is not installed")
+    actual = hashlib.sha256(backend.read_bytes()).hexdigest()
+    if actual != expected:
+        raise SystemExit("refusing: switch backend hash does not match ports.conf")
+    return backend
+
+
+def show(config):
+    print(f"{'LABEL':<7} {'VSC':<11} {'VLAN':<5} {'CPU':<7} VERIFIED")
+    for label in LABELS:
+        port = config[label]
+        print(f"{label:<7} {port['vsc_port']:<11} {port['vlan']:<5} {port['cpu_interface']:<7} {port['verified']}")
+
+
+def status(config):
+    show(config)
+    platform = config["platform"]
+    print(f"mapping_verified={platform.get('mapping_verified', 'no')}")
+    print(f"cpu_mapping_verified={platform.get('cpu_mapping_verified', 'no')}")
+    print(f"serial_recovery_ready={'yes' if SERIAL_MARKER.exists() else 'no'}")
+    print(f"network_commissioned={'yes' if COMMISSIONED.exists() else 'no'}")
+    print(f"rollback_armed={'yes' if ROLLBACK_MARKER.exists() else 'no'}")
+    print(f"management_client_subnet={platform.get('management_client_subnet', 'UNVERIFIED')}")
+    print(f"management_gateway={platform.get('management_gateway', 'UNVERIFIED')}")
+    for label in LABELS[1:]:
+        result = run(["ip", "link", "show", bridge(label)], capture=True)
+        print(f"{bridge(label)}={'present' if result.returncode == 0 else 'absent'}")
+    management = platform.get("management_interface", "mgmt0")
+    address = run(["ip", "-4", "-o", "addr", "show", "dev", management], capture=True)
+    print(f"management_ipv4={address.stdout.strip() or 'none'}")
+
+
+def arm_rollback():
+    if ROLLBACK_MARKER.exists():
+        previous = ROLLBACK_MARKER.read_text().strip()
+        if previous.startswith("mx84-port-rollback-"):
+            run(["systemctl", "stop", previous + ".timer"], check=False)
+    unit = f"mx84-port-rollback-{int(time.time())}-{os.getpid()}"
+    run([
+        "systemd-run", f"--unit={unit}", "--on-active=2m",
+        "/usr/sbin/mx84-port", "rollback"
+    ], check=True)
+    ROLLBACK_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    ROLLBACK_MARKER.write_text(unit + "\n")
+
+
+def managed_links(config):
+    names = [bridge(label) for label in LABELS[1:]]
+    names.extend(uplink(config, label) for label in LABELS[1:])
+    names.append("br-pfctl")
+    return names
+
+
+def prepare_link_ownership(config):
+    existing = [name for name in managed_links(config) if run(["ip", "link", "show", name], capture=True).returncode == 0]
+    if existing:
+        raise SystemExit("refusing first apply: managed links already exist: " + ", ".join(existing))
+    mtus = {}
+    try:
+        for trunk in router_trunks(config):
+            mtus[trunk] = int((SYS_CLASS_NET / trunk / "mtu").read_text().strip())
+    except (OSError, ValueError):
+        raise SystemExit(f"refusing first apply: cannot read original MTU for {trunk}")
+    atomic_bytes(TRUNK_MTU, (json.dumps(mtus) + "\n").encode(), 0o600)
+    atomic_bytes(OWNED_LINKS, ("\n".join(managed_links(config)) + "\n").encode(), 0o600)
+
+
+def create_virtual_links(config):
+    for trunk in router_trunks(config):
+        run(["ip", "link", "set", "dev", trunk, "mtu", "1516"], check=True)
+        run(["sysctl", "-q", "-w", f"net/ipv6/conf/{trunk}/disable_ipv6=1"], check=True)
+        run(["ip", "address", "flush", "dev", trunk], check=True)
+    for label in LABELS[1:]:
+        trunk = cpu_interface(config, label)
+        vlan = config[label]["vlan"]
+        vlan_name = uplink(config, label)
+        if run(["ip", "link", "show", vlan_name], capture=True).returncode != 0:
+            run(["ip", "link", "add", "link", trunk, "name", vlan_name, "type", "vlan", "id", vlan], check=True)
+        name = bridge(label)
+        if run(["ip", "link", "show", name], capture=True).returncode != 0:
+            run(["ip", "link", "add", "name", name, "type", "bridge"], check=True)
+        run(["ip", "link", "set", "dev", vlan_name, "master", name], check=True)
+        for interface in (vlan_name, name):
+            run(["sysctl", "-q", "-w", f"net/ipv6/conf/{interface}/disable_ipv6=1"], check=True)
+            run(["ip", "address", "flush", "dev", interface], check=True)
+        run(["ip", "link", "set", "dev", vlan_name, "mtu", "1500", "up"], check=True)
+        run(["ip", "link", "set", "dev", name, "mtu", "1500", "up"], check=True)
+    if run(["ip", "link", "show", "br-pfctl"], capture=True).returncode != 0:
+        run(["ip", "link", "add", "name", "br-pfctl", "type", "bridge"], check=True)
+    run(["sysctl", "-q", "-w", "net/ipv6/conf/br-pfctl/disable_ipv6=1"], check=True)
+    run(["ip", "address", "flush", "dev", "br-pfctl"], check=True)
+    run(["ip", "address", "replace", "172.31.84.1/30", "dev", "br-pfctl"], check=True)
+    run(["ip", "link", "set", "dev", "br-pfctl", "mtu", "1500", "up"], check=True)
+    run(["sysctl", "-q", "-w", "net.ipv4.conf.br-pfctl.forwarding=0"], check=True)
+    run(["sysctl", "-q", "-w", "net.ipv6.conf.br-pfctl.forwarding=0"], check=False)
+
+
+def prepare_management(config):
+    source = Path("/usr/lib/mx84-platform/interfaces-mgmt")
+    destination = NETWORK_DIR / "interfaces.d/mx84-platform"
+    expected = source.read_text()
+    if destination.exists() and destination.read_text() != expected:
+        raise SystemExit(f"refusing to replace existing management config: {destination}")
+    if not destination.exists():
+        atomic_bytes(destination, expected.encode())
+        atomic_bytes(MGMT_CONFIG_OWNED, (str(destination) + "\n").encode(), 0o600)
+
+
+def atomic_bytes(path, data, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".new")
+    temporary.write_bytes(data)
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def retire_legacy_eth0():
+    candidates = [NETWORK_DIR / "interfaces"]
+    directory = NETWORK_DIR / "interfaces.d"
+    if directory.exists():
+        candidates.extend(path for path in sorted(directory.iterdir()) if path.is_file())
+    matches = []
+    for path in candidates:
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        if re.search(r"(?m)^\s*iface\s+eth0\s+inet\s+dhcp\s*$", text):
+            matches.append((path, text))
+    if not matches and RECOVERY_INTERFACES.exists() and RECOVERY_INTERFACES_PATH.exists():
+        return
+    if len(matches) != 1:
+        raise SystemExit(f"refusing eth0 retirement: expected one DHCP stanza, found {len(matches)}")
+    path, text = matches[0]
+    active = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    allowed = {"auto eth0", "allow-hotplug eth0", "iface eth0 inet dhcp"}
+    if any(line not in allowed for line in active):
+        raise SystemExit(f"refusing eth0 retirement: {path} contains unrelated configuration")
+    if not RECOVERY_INTERFACES.exists():
+        atomic_bytes(RECOVERY_INTERFACES, path.read_bytes(), 0o600)
+        atomic_bytes(RECOVERY_INTERFACES_PATH, (str(path) + "\n").encode(), 0o600)
+    run(["ifdown", "eth0"], check=False)
+    run(["ip", "address", "flush", "dev", "eth0"], check=False)
+    atomic_bytes(path, b"# eth0 DHCP retired after verified MX84 management cutover\n")
+
+
+def restore_legacy_eth0():
+    if not RECOVERY_INTERFACES.exists() or not RECOVERY_INTERFACES_PATH.exists():
+        return
+    path = Path(RECOVERY_INTERFACES_PATH.read_text().strip())
+    if not path.is_absolute() or NETWORK_DIR not in path.parents:
+        raise SystemExit("refusing unsafe recovery-interface path")
+    atomic_bytes(path, RECOVERY_INTERFACES.read_bytes())
+
+
+def restore_local_network(config):
+    owned = set(OWNED_LINKS.read_text().splitlines()) if OWNED_LINKS.exists() else set()
+    allowed = set(managed_links(config))
+    if not owned <= allowed:
+        print("warning: unsafe managed-link ownership record; leaving local links untouched", file=sys.stderr)
+        owned = set()
+    for label in reversed(LABELS[1:]):
+        name = bridge(label)
+        vlan_name = uplink(config, label)
+        if name in owned:
+            run(["ip", "link", "set", "dev", name, "down"], check=False)
+            run(["ip", "link", "del", "dev", name, "type", "bridge"], check=False)
+        if vlan_name in owned:
+            run(["ip", "link", "del", "dev", vlan_name], check=False)
+    if "br-pfctl" in owned:
+        run(["ip", "link", "set", "dev", "br-pfctl", "down"], check=False)
+        run(["ip", "link", "del", "dev", "br-pfctl", "type", "bridge"], check=False)
+    if TRUNK_MTU.exists():
+        try:
+            saved = json.loads(TRUNK_MTU.read_text())
+            # Older packages saved only eth3's MTU as a scalar.
+            mtus = {"eth3": saved} if isinstance(saved, int) else saved
+            if not isinstance(mtus, dict) or not set(mtus) <= set(router_trunks(config)):
+                raise ValueError
+            if any(type(mtu) is not int or not 576 <= mtu <= 65535 for mtu in mtus.values()):
+                raise ValueError
+        except ValueError:
+            print("warning: unsafe saved trunk MTU; leaving it unchanged", file=sys.stderr)
+        else:
+            for trunk, mtu in mtus.items():
+                run(["ip", "link", "set", "dev", trunk, "mtu", str(mtu)], check=False)
+    if MGMT_CONFIG_OWNED.exists():
+        destination = Path(MGMT_CONFIG_OWNED.read_text().strip())
+        expected = Path("/usr/lib/mx84-platform/interfaces-mgmt").read_bytes()
+        if destination.is_absolute() and NETWORK_DIR in destination.parents and destination.exists() and destination.read_bytes() == expected:
+            destination.unlink()
+        MGMT_CONFIG_OWNED.unlink(missing_ok=True)
+    OWNED_LINKS.unlink(missing_ok=True)
+    TRUNK_MTU.unlink(missing_ok=True)
+
+
+def apply(config):
+    require_root()
+    if COMMISSIONED.exists():
+        raise SystemExit("network is already commissioned; use mx84-port reapply")
+    backend = validate(config, require_serial=True)
+    prepare_link_ownership(config)
+    prepare_management(config)
+    arm_rollback()
+    run([str(backend), "apply", str(CONFIG)], check=True)
+    create_virtual_links(config)
+    run(["ifup", config["platform"]["management_interface"]], check=False)
+    configure_management_route(config)
+    print("profile applied with two-minute rollback armed")
+    print("verify SSH through the MGMT jack, then run: mx84-port confirm")
+
+
+def verify(config):
+    backend = validate(config)
+    management = config["platform"]["management_interface"]
+    address = run(["ip", "-4", "-o", "addr", "show", "dev", management], capture=True)
+    if not address.stdout.strip():
+        raise SystemExit("refusing confirmation: management interface has no IPv4 address")
+    if run(["systemctl", "is-active", "--quiet", "ssh.service"]).returncode != 0:
+        raise SystemExit("refusing confirmation: SSH service is not active")
+    if run([str(backend), "verify", str(CONFIG)]).returncode != 0:
+        raise SystemExit("refusing confirmation: switch readback failed")
+    verify_virtual_links(config)
+    return True
+
+
+def interface_addresses(interface):
+    result = run(["ip", "-o", "address", "show", "dev", interface], capture=True)
+    if result.returncode != 0:
+        raise SystemExit(f"verification failed: missing interface {interface}")
+    addresses = set()
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        for family in ("inet", "inet6"):
+            if family in fields:
+                index = fields.index(family)
+                if index + 1 < len(fields):
+                    addresses.add(fields[index + 1])
+    return addresses
+
+
+def verify_virtual_links(config):
+    for trunk in router_trunks(config):
+        if interface_addresses(trunk):
+            raise SystemExit(f"verification failed: host address present on trunk {trunk}")
+    for label in LABELS[1:]:
+        name = bridge(label)
+        vlan_name = uplink(config, label)
+        members_path = SYS_CLASS_NET / name / "brif"
+        try:
+            members = {path.name for path in members_path.iterdir()}
+        except OSError:
+            raise SystemExit(f"verification failed: missing bridge {name}")
+        if vlan_name not in members:
+            raise SystemExit(f"verification failed: {vlan_name} is not attached to {name}")
+        unexpected = sorted(member for member in members - {vlan_name} if not member.startswith("vnet"))
+        if unexpected:
+            raise SystemExit(f"verification failed: unexpected member on {name}: {', '.join(unexpected)}")
+        for interface in (vlan_name, name):
+            if interface_addresses(interface):
+                raise SystemExit(f"verification failed: host address present on {interface}")
+    control_members = SYS_CLASS_NET / "br-pfctl" / "brif"
+    try:
+        unexpected = sorted(path.name for path in control_members.iterdir() if not path.name.startswith("vnet"))
+    except OSError:
+        raise SystemExit("verification failed: missing bridge br-pfctl")
+    if unexpected:
+        raise SystemExit("verification failed: physical member on br-pfctl: " + ", ".join(unexpected))
+    if interface_addresses("br-pfctl") != {"172.31.84.1/30"}:
+        raise SystemExit("verification failed: br-pfctl does not have only 172.31.84.1/30")
+
+
+def management_addresses(config):
+    interface = config["platform"]["management_interface"]
+    result = run(["ip", "-4", "-o", "addr", "show", "dev", interface], capture=True)
+    addresses = set()
+    for field in result.stdout.split():
+        if "/" not in field:
+            continue
+        try:
+            addresses.add(str(ipaddress.ip_interface(field).ip))
+        except ValueError:
+            pass
+    return addresses
+
+
+def endpoint_host(endpoint):
+    if endpoint.startswith("["):
+        return endpoint[1:].split("]", 1)[0]
+    return endpoint.rsplit(":", 1)[0]
+
+
+def ssh_on_management(config):
+    addresses = management_addresses(config)
+    connection = os.environ.get("SSH_CONNECTION", "").split()
+    if len(connection) == 4 and connection[2] in addresses:
+        return True
+    sessions = run(["ss", "-Htn", "state", "established", "sport", "=", ":22"], capture=True)
+    for line in sessions.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and endpoint_host(fields[2]) in addresses:
+            return True
+    return False
+
+
+def confirm(config, require_ssh=True):
+    require_root()
+    verify(config)
+    if require_ssh and not ssh_on_management(config):
+        raise SystemExit("refusing confirmation: no established SSH session terminates on the management IPv4 address")
+    if not ROLLBACK_MARKER.exists():
+        raise SystemExit("refusing confirmation: no armed rollback was recorded")
+    unit = ROLLBACK_MARKER.read_text().strip()
+    if not unit.startswith("mx84-port-rollback-"):
+        raise SystemExit("refusing confirmation: invalid rollback unit marker")
+    retire_legacy_eth0()
+    run(["systemctl", "stop", unit + ".timer"], check=True)
+    ROLLBACK_MARKER.unlink(missing_ok=True)
+    COMMISSIONED.parent.mkdir(parents=True, exist_ok=True)
+    COMMISSIONED.touch()
+    Path("/run/mx84/switch-profile-failed").unlink(missing_ok=True)
+    run(["systemctl", "enable", "mx84-network.service"], check=True)
+    print("switch readback, management IPv4, SSH service, and bridges verified; rollback cancelled")
+
+
+def reapply(config):
+    require_root()
+    if not COMMISSIONED.exists():
+        print("network is not commissioned; leaving flat recovery state unchanged")
+        return
+    backend = validate(config)
+    prepare_management(config)
+    arm_rollback()
+    run([str(backend), "apply", str(CONFIG)], check=True)
+    create_virtual_links(config)
+    run(["ifup", config["platform"]["management_interface"]], check=False)
+    configure_management_route(config)
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        try:
+            confirm(config, require_ssh=False)
+            print("commissioned network reapplied and verified")
+            return
+        except SystemExit:
+            time.sleep(5)
+    raise SystemExit("boot verification timed out; automatic flat rollback remains armed")
+
+
+def disconnect_router_uplinks(config):
+    uplinks = []
+    for label in LABELS[1:]:
+        name = bridge(label)
+        vlan_name = uplink(config, label)
+        members_path = SYS_CLASS_NET / name / "brif"
+        if members_path.exists():
+            unexpected = [member.name for member in members_path.iterdir()
+                          if member.name != vlan_name and not member.name.startswith("vnet")]
+            if unexpected:
+                raise SystemExit(f"refusing flat recovery: unexpected member on {name}: {', '.join(unexpected)}")
+        if (SYS_CLASS_NET / vlan_name).exists():
+            uplinks.append(vlan_name)
+    # Shutdown is asynchronous; disconnect physical paths before sharing VLAN 1.
+    for interface in uplinks:
+        run(["ip", "link", "set", "dev", interface, "down"], check=True)
+        run(["ip", "link", "set", "dev", interface, "nomaster"], check=True)
+
+
+def rollback(config):
+    require_root()
+    COMMISSIONED.unlink(missing_ok=True)
+    run(["systemctl", "disable", "mx84-pfsense.service"], check=False)
+    run(["virsh", "--connect", "qemu:///system", "autostart", "--disable", "pfsense"], check=False)
+    disconnect_router_uplinks(config)
+    run(["systemctl", "stop", "mx84-pfsense.service"], check=False)
+    run(["virsh", "--connect", "qemu:///system", "shutdown", "pfsense"], check=False)
+    backend = Path(config["platform"].get("switch_backend", ""))
+    if backend.is_file() and os.access(backend, os.X_OK):
+        run([str(backend), "flat", str(CONFIG)], check=False)
+    remove_management_route(config)
+    restore_local_network(config)
+    restore_legacy_eth0()
+    run(["ip", "link", "set", "dev", "eth0", "up"], check=False)
+    run(["ifup", "eth0"], check=False)
+    Path("/run/mx84").mkdir(parents=True, exist_ok=True)
+    Path("/run/mx84/switch-profile-failed").touch()
+    ROLLBACK_MARKER.unlink(missing_ok=True)
+    print("flat recovery requested; eth0 restored; pfSense uplinks isolated, shutdown requested, autostart disabled")
+
+
+def identify(config, args):
+    if not args or len(args) > 2:
+        raise SystemExit("usage: mx84-port identify LABEL [SECONDS]")
+    label = args[0].upper()
+    if label not in LABELS:
+        raise SystemExit(f"unknown chassis label: {label}")
+    seconds = int(args[1]) if len(args) == 2 else 30
+    if seconds < 1 or seconds > 300:
+        raise SystemExit("identification duration must be 1 through 300 seconds")
+    if not config["platform"].getboolean("port_led_verified", fallback=False):
+        raise SystemExit("port identification is gated: VSC7425 LED control is unverified")
+    helper = Path("/usr/lib/mx84-platform/mx84-port-led")
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        raise SystemExit("port identification helper is not installed")
+    run([str(helper), label, str(seconds)], check=True)
+
+
+def main():
+    config = load_config()
+    command = sys.argv[1] if len(sys.argv) > 1 else "list"
+    if command == "list":
+        show(config)
+    elif command == "status":
+        status(config)
+    elif command == "apply":
+        apply(config)
+    elif command == "verify":
+        verify(config)
+        print("switch readback, management IPv4, SSH service, and bridges verified")
+    elif command == "confirm":
+        confirm(config)
+    elif command == "reapply":
+        reapply(config)
+    elif command == "rollback":
+        rollback(config)
+    elif command == "identify":
+        identify(config, sys.argv[2:])
+    else:
+        raise SystemExit("usage: mx84-port list|status|apply|verify|confirm|reapply|rollback|identify LABEL [SECONDS]")
+
+
+if __name__ == "__main__":
+    main()

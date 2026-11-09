@@ -1,0 +1,11 @@
+#!/bin/sh
+
+case "${1:-start}" in
+	start)
+		/usr/sbin/mx84-led boot >/var/log/mx84-led.log 2>&1 &
+		;;
+	stop)
+		killall mx84-led 2>/dev/null || true
+		/usr/sbin/mx84-led off
+		;;
+esac
