@@ -779,7 +779,26 @@ def test_led_subprocess_failures():
         assert led.last["center"] == ("blue",)
 
 
+def test_build_requires_private_storage_identity():
+    source = HERE.parent / "build.sh"
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        script = root / "build.sh"
+        script.write_bytes(source.read_bytes())
+        (root / "VERSION").write_text("0.0.0\n")
+        identity = root / "root/usr/lib/udev/rules.d/68-mx84-preserve-phison.rules"
+        for body in (None, 'ATTRS{serial}=="REPLACE_WITH_VERIFIED_SERIAL"\n', '# missing identity\n'):
+            if body is not None:
+                identity.parent.mkdir(parents=True, exist_ok=True)
+                identity.write_text(body)
+            result = subprocess.run(["sh", str(script)], capture_output=True, text=True)
+            assert result.returncode != 0
+            assert "verified local Phison identity rule" in result.stderr
+            assert not (root / "dist").exists()
+
+
 if __name__ == "__main__":
+    test_build_requires_private_storage_identity()
     test_led_subprocess_failures()
     test_hold_gate()
     test_cpu_and_usb()
