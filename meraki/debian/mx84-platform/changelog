@@ -1,3 +1,10 @@
+mx84-platform (0.1.21) unstable; urgency=medium
+
+  * Treat timed-out or unavailable status commands as failed checks instead of
+    crashing LED automation. Retry failed LED writes without caching success.
+
+ -- MX84 Project <mx84-project@users.noreply.github.com>  Mon, 09 Nov 2026 01:00:00 -0600
+
 mx84-platform (0.1.20) unstable; urgency=medium
 
   * Keep pfSense running across libvirtd maintenance restarts.

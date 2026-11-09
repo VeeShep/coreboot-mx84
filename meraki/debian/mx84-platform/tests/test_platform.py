@@ -763,7 +763,24 @@ def test_api_health_contract():
     assert ledd.NoRedirect().redirect_request(None, None, 302, "", {}, "http://example.invalid") is None
 
 
+def test_led_subprocess_failures():
+    platform = ledd.PlatformState({})
+    led = ledd.Led()
+    for error in (subprocess.TimeoutExpired("virsh", 5), FileNotFoundError("missing command")):
+        with mock.patch.object(ledd.subprocess, "run", side_effect=error):
+            assert not platform.service_active("mx84-switch.service")
+            assert platform.domain_state() == "absent"
+            assert not led.set("blue")
+            assert not led.last, "failed LED writes must be retried"
+    with mock.patch.object(ledd.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout="running\n")):
+        assert platform.service_active("mx84-switch.service")
+        assert platform.domain_state() == "running"
+        assert led.set("blue")
+        assert led.last["center"] == ("blue",)
+
+
 if __name__ == "__main__":
+    test_led_subprocess_failures()
     test_hold_gate()
     test_cpu_and_usb()
     test_center_gradient_and_port_gate()
